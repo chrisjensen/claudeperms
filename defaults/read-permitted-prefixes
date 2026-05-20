@@ -1,0 +1,14 @@
+# Absolute path prefixes permitted for READS in addition to cwd and
+# permitted-paths. Used by Bash path checks and Read/Glob/Grep tools.
+# Does not permit writes — see write-permitted-prefixes for those.
+#
+# Lines starting with ~/ expand to $HOME. Lines starting with # are comments.
+
+/usr/
+/bin/
+/sbin/
+/opt/
+/var/
+/etc/
+/tmp/
+~/src/

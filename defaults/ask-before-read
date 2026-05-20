@@ -1,0 +1,25 @@
+# Patterns that force an "ask before read" prompt. Pattern shapes:
+#   - Bare basename:     .env             (matches any path whose basename is .env)
+#   - Glob:              *.pem            (matches basename via simple * -> [^/]*)
+#   - Directory prefix:  ~/.ssh/          (any path inside that directory)
+#   - Absolute prefix:   /etc/secret/     (any path inside)
+#   - Path-with-suffix:  .claude/settings.json (matches path ending in this)
+# Lines starting with # are comments. ~/ expands to $HOME.
+
+.env
+.env.*
+id_rsa
+id_ed25519
+id_ecdsa
+id_dsa
+*.pem
+*.key
+~/.ssh/
+~/.aws/credentials
+~/.aws/config
+~/.netrc
+~/.git-credentials
+~/.config/gh/hosts.yml
+~/.config/gh/config.yml
+~/.bash_history
+~/.zsh_history

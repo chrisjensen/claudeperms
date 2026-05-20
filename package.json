@@ -1,0 +1,13 @@
+{
+  "name": "claude-perms",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "setup": "mkdir -p ~/.claudeperms && cp hooks/permissions.mjs ~/.claudeperms/permissions.mjs && cp -n defaults/* ~/.claudeperms/"
+  },
+  "engines": {
+    "npm": ">=11.14.0"
+  }
+}

@@ -1,0 +1,28 @@
+# Patterns that force an "ask before write" prompt — applies to Write/Edit
+# tools and to inferred Bash write targets (redirects, tee, sed -i, mv/cp).
+# Same pattern shapes as ask-before-read.
+
+.env
+.env.*
+id_rsa
+id_ed25519
+id_ecdsa
+id_dsa
+*.pem
+*.key
+~/.ssh/
+~/.aws/credentials
+~/.aws/config
+~/.netrc
+~/.git-credentials
+~/.config/gh/hosts.yml
+~/.config/gh/config.yml
+~/.bash_history
+~/.zsh_history
+CLAUDE.md
+~/.claude/skills/
+~/.claude/settings.json
+~/.claude/settings.local.json
+.claude/settings.json
+.claude/settings.local.json
+~/.gitconfig

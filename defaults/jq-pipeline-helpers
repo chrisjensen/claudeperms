@@ -1,0 +1,14 @@
+# Commands allowed as segments of a jq pipeline. The carve-out fires when
+# every segment's leading command is in this list AND at least one segment is
+# `jq`. Used to let routine JSON munging through without prompting.
+
+jq
+cat
+curl
+head
+tail
+grep
+awk
+sort
+uniq
+wc

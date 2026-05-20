@@ -1,0 +1,13 @@
+{
+  "domains": [
+    "docs.anthropic.com",
+    "developer.mozilla.org",
+    "nodejs.org",
+    "262.ecma-international.org"
+  ],
+  "urlPrefixes": [
+    "https://github.com/anthropics/",
+    "https://api.github.com/repos/anthropics/",
+    "https://raw.githubusercontent.com/anthropics/"
+  ]
+}

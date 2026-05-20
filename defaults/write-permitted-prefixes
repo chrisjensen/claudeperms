@@ -1,0 +1,9 @@
+# Absolute path prefixes permitted for WRITES in addition to cwd and
+# permitted-paths. Intentionally narrow. Writes to /usr/, /bin/, /etc/, etc.
+# fall through to the gate and ask the user — overwriting system binaries
+# should never be silent.
+#
+# Lines starting with ~/ expand to $HOME. Lines starting with # are comments.
+
+/tmp/
+~/src/

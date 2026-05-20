@@ -1,0 +1,19 @@
+# Patterns that trigger an "inline code execution detected" ask. The hook
+# prefers reviewable script files over arbitrary code on the command line.
+#
+# Format: <command> <flag1> [<flag2> ...]
+# Each line compiles into a regex of the form
+#   \b<command>\s+(?:--?[\w-]+\s+)*(?:<flag1>|<flag2>|...)\b
+# so intermediate flags are allowed (e.g. `node -i -e "..."` still matches).
+# The ask reason uses "<command> <flag1>" as the human-readable name.
+#
+# If this file is missing or empty, the inline-exec check does NOT fire and
+# `node -e ...` / `python -c ...` etc. pass without prompting.
+
+node -e -p --eval --print
+bun -e
+python -c
+python3 -c
+ruby -e
+perl -e
+deno eval

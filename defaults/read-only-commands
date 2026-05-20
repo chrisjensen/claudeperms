@@ -1,0 +1,144 @@
+# Command prefixes treated as read-only. Used by the sandbox-disabled carve-out.
+# A line matches if the (de-wrapped) command equals the line exactly OR starts
+# with the line plus a space. Don't shorten "git log" to "git" or "gh pr" to
+# "gh" — that would also cover write-capable subcommands.
+
+# Bare-leading read-only utilities (any args)
+ls
+cat
+pwd
+head
+tail
+wc
+stat
+find
+tree
+grep
+egrep
+fgrep
+rg
+fd
+fdfind
+echo
+printf
+date
+whoami
+id
+uname
+hostname
+env
+printenv
+which
+type
+df
+du
+free
+lsof
+ps
+pgrep
+ss
+netstat
+jq
+sort
+uniq
+cut
+tr
+column
+tac
+rev
+fold
+diff
+cmp
+comm
+paste
+base64
+xxd
+hexdump
+od
+strings
+file
+readlink
+realpath
+dirname
+basename
+man
+info
+help
+true
+false
+sleep
+test
+expr
+seq
+tput
+arch
+nproc
+locale
+groups
+sha256sum
+sha1sum
+md5sum
+
+# git read-only subcommands (one per safe verb — NOT `git` alone)
+git status
+git log
+git diff
+git show
+git blame
+git branch
+git tag
+git remote
+git ls-files
+git ls-remote
+git rev-parse
+git describe
+git reflog
+git shortlog
+git cat-file
+git for-each-ref
+git worktree list
+git stash list
+git stash show
+git config --get
+git config --list
+git config -l
+
+# gh read-only — every safe verb listed explicitly.
+# `gh api` is special-cased in the hook (inspects -X/--method and body flags).
+gh pr list
+gh pr view
+gh pr diff
+gh pr checks
+gh pr status
+gh issue list
+gh issue view
+gh issue status
+gh run list
+gh run view
+gh workflow list
+gh workflow view
+gh repo view
+gh release list
+gh release view
+gh auth status
+
+# docker read-only
+docker ps
+docker images
+docker logs
+docker inspect
+
+# bd (beads) read-only verbs only
+bd ready
+bd list
+bd show
+bd blocked
+bd stats
+bd doctor
+
+# npm read-only queries
+npm view
+npm show
+npm ls
+npm outdated
+npm config get
