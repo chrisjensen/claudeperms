@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "setup": "mkdir -p ~/.claudeperms && cp hooks/permissions.mjs ~/.claudeperms/permissions.mjs && cp -n defaults/* ~/.claudeperms/"
+    "setup": "mkdir -p ~/.claudeperms && cp hooks/permissions.mjs ~/.claudeperms/permissions.mjs && cp hooks/check-malicious.mjs ~/.claudeperms/check-malicious.mjs && chmod 0755 ~/.claudeperms/check-malicious.mjs && cp -n defaults/* ~/.claudeperms/"
   },
   "engines": {
     "npm": ">=11.14.0"
