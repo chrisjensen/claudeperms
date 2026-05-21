@@ -1,0 +1,8 @@
+{
+  "name": "claudeperms-runtime",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "anti-trojan-source": "^1.11.0"
+  }
+}

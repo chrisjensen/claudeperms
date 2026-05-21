@@ -1,7 +1,12 @@
 #!/usr/bin/env node
-// Reads code/diff from stdin, invokes Claude in maximally-isolated mode to
-// review for malicious patterns and prompt injection. Emits only PASS or
-// FAIL + log-path on stdout — reviewer output never cascades to the caller.
+// Reads code/diff from stdin and screens it for malicious content in two stages:
+//   1. Deterministic unicode-attack pre-check via anti-trojan-source. Fails fast
+//      with `FAIL\nBidi characters present` if any bidi/zero-width/tag/confusable
+//      character is found — no LLM round-trip.
+//   2. Otherwise invokes Claude in maximally-isolated mode to review for the
+//      semantic categories (credential exfil, install hooks, eval/obfuscation,
+//      suspicious network). Reviewer output never cascades to the caller — only
+//      PASS or `FAIL\nReviewer output: <log>` reaches stdout.
 //
 // Usage:  git diff main...HEAD | check-malicious.mjs
 // Exit codes:  0 safe  1 concerns  2 empty input  3 reviewer invocation failed
@@ -11,6 +16,7 @@ import { randomBytes } from 'node:crypto';
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { hasConfusables } from 'anti-trojan-source';
 
 async function readStdin() {
   const chunks = [];
@@ -58,6 +64,7 @@ async function runReviewer(systemPrompt, diff) {
 
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
+      setTimeout(() => child.kill('SIGKILL'), 2_000).unref();
       reject(new Error('reviewer timed out after 120s'));
     }, 120_000);
 
@@ -89,6 +96,11 @@ async function main() {
   if (!diff.trim()) {
     process.stderr.write('check-malicious: no input — pipe a diff or code to stdin\n');
     process.exit(2);
+  }
+
+  if (hasConfusables({ sourceText: diff })) {
+    process.stdout.write('FAIL\nBidi characters present\n');
+    process.exit(1);
   }
 
   const nonce = 'SAFE-' + randomBytes(16).toString('hex');

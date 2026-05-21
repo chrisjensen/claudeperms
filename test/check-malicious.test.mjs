@@ -117,6 +117,17 @@ describe('check-malicious', () => {
     assert.match(stderr, /reviewer invocation failed/i);
   });
 
+  test('FAIL on bidi override (deterministic pre-check, no LLM round-trip)', async () => {
+    // U+202E RIGHT-TO-LEFT OVERRIDE embedded in otherwise benign code.
+    const malicious = 'function admin() { /* ‮ evil */ }';
+    // Stub is set to emit-nonce — if the pre-check ran the LLM stub anyway,
+    // this test would PASS instead of FAIL. The exact stdout match proves
+    // the deterministic path short-circuited before the reviewer.
+    const { exitCode, stdout } = await runCheck(malicious, 'emit-nonce');
+    assert.equal(exitCode, 1);
+    assert.equal(stdout.trim(), 'FAIL\nBidi characters present');
+  });
+
   test('reviewer output never leaks to stdout on failure', async () => {
     const { stdout } = await runCheck('some diff', 'emit-issues');
     // stdout must only contain the FAIL line and log path — not reviewer prose
