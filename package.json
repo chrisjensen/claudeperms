@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "setup": "mkdir -p ~/.claudeperms && cp hooks/permissions.mjs ~/.claudeperms/permissions.mjs && cp hooks/check-malicious.mjs ~/.claudeperms/check-malicious.mjs && chmod 0755 ~/.claudeperms/check-malicious.mjs && find defaults -maxdepth 1 -type f ! -name claudeperms-package.json -exec cp -n {} ~/.claudeperms/ \\; && cp -n defaults/claudeperms-package.json ~/.claudeperms/package.json && (cd ~/.claudeperms && npm install --omit=dev --no-audit --no-fund)"
+    "setup": "mkdir -p ~/.claudeperms && cp hooks/permissions.mjs ~/.claudeperms/permissions.mjs && cp hooks/check-malicious.mjs ~/.claudeperms/check-malicious.mjs && chmod 0755 ~/.claudeperms/check-malicious.mjs && find defaults -maxdepth 1 -type f ! -name claudeperms-package.json -exec cp -n {} ~/.claudeperms/ \\; && cp -n defaults/claudeperms-package.json ~/.claudeperms/package.json && (cd ~/.claudeperms && npm install --omit=dev --no-audit --no-fund)",
+    "setup:skill": "mkdir -p ~/.claude/skills/check-for-prompt-injection && cp defaults/skills/check-for-prompt-injection/SKILL.md ~/.claude/skills/check-for-prompt-injection/SKILL.md"
   },
   "engines": {
     "npm": ">=11.14.0"

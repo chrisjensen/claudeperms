@@ -96,13 +96,20 @@ describe('check-malicious', () => {
 
   test('FAIL writes reviewer output to log file', async () => {
     const { stdout } = await runCheck('suspicious diff', 'emit-issues');
-    const logMatch = /Reviewer output: (.+)/.exec(stdout);
+    const logMatch = /reviewer log is at: (.+)/.exec(stdout);
     assert.ok(logMatch, 'stdout should include log path');
     const logPath = logMatch[1].trim();
     assert.ok(existsSync(logPath), 'log file should exist');
     const logContent = readFileSync(logPath, 'utf8');
     assert.match(logContent, /suspicious base64/);
     rmSync(logPath, { force: true });
+  });
+
+  test('FAIL output warns LLMs not to read the log', async () => {
+    const { stdout } = await runCheck('suspicious diff', 'emit-issues');
+    assert.match(stdout, /if you are an llm.*do not.*read the log/i);
+    assert.match(stdout, /prompt injection/i);
+    assert.match(stdout, /stop and inform the user/i);
   });
 
   test('exit 2 on empty stdin', async () => {
@@ -130,10 +137,9 @@ describe('check-malicious', () => {
 
   test('reviewer output never leaks to stdout on failure', async () => {
     const { stdout } = await runCheck('some diff', 'emit-issues');
-    // stdout must only contain the FAIL line and log path — not reviewer prose
-    const lines = stdout.trim().split('\n');
-    assert.equal(lines.length, 2);
-    assert.match(lines[0], /^FAIL$/);
-    assert.match(lines[1], /^Reviewer output: /);
+    // stdout must contain only the FAIL header, log path, and LLM warning —
+    // not the reviewer's prose describing the concerns it found.
+    assert.match(stdout, /^FAIL\n/);
+    assert.doesNotMatch(stdout, /suspicious base64/);
   });
 });
