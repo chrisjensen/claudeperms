@@ -9,7 +9,7 @@ A `PreToolUse` hook for [Claude Code](https://docs.anthropic.com/en/docs/claude-
 For each tool call, the hook emits `allow`, `ask`, or `deny`:
 
 - **Bash**
-  - Denies `rm`, `shred`, `unlink`, `truncate`, `cat /dev/null >`, and redirects that would truncate an existing file. Use `mv <file> .trash/` instead.
+  - Denies `rm`, `shred`, `unlink`, `truncate`, `cat /dev/null >`, and redirects that would truncate an existing file. Use `mv <file> <trash>/` instead. Trash location and enablement are configured in `~/.claudeperms/config.json` — when trash is disabled, these commands ask instead of denying; when every deletion target is already inside the trash directory, they ask (to support emptying the trash).
   - Asks before referencing sensitive files (`.env`, `id_rsa`, `~/.ssh/`, `~/.aws/credentials`, shell histories, etc.).
   - Asks before inline code execution (`node -e`, `python -c`, `ruby -e`, …) so reviewable script files are preferred.
   - Asks before `dd`, raw disk devices (`/dev/sd*`, `/dev/nvme*`), or `/proc/` reads.
@@ -71,6 +71,7 @@ All config lives under `~/.claudeperms/`. Each file is one entry per line (`#` f
 
 | File | Purpose | Empty / missing |
 |---|---|---|
+| `config.json` | General hook config. Currently: `trash.enabled` (bool) toggles the deletion deny, `trash.location` (string, supports `~/` and cwd-relative) names the trash directory referenced in deny messages and used for the "deletion inside trash" carve-out. | Trash disabled — all `rm`/`shred`/`unlink`/`truncate`/`cat /dev/null >` commands ask instead of denying. |
 | `approved-domains.json` | WebFetch allowlist. `domains` matches host + subdomains; `urlPrefixes` matches URL prefix. | All WebFetch calls ask. |
 | `ask-before-read` | Patterns whose Read triggers an ask. Shapes: bare basename (`.env`), glob (`*.pem`), dir prefix (`~/.ssh/`), absolute prefix (`/etc/secret/`), or relative path (`.claude/settings.json`). Prefix a line with `!` to negate — a matching `!pattern` cancels a positive match (used in the default `ask-before-write` to carve `~/.claude/plans/` out of the blanket `.claude/` gate). Takes precedence over `read-permitted-prefixes`. | Sensitive-read gate disabled; reads pass through path checks only. |
 | `ask-before-write` | Same shape (including `!pattern` negation); gates Write/Edit tools and Bash write-targets. Takes precedence over `write-permitted-prefixes`. | Sensitive-write gate disabled. |
@@ -84,9 +85,30 @@ All config lives under `~/.claudeperms/`. Each file is one entry per line (`#` f
 Notes:
 
 - **Precedence.** `ask-before-*` is checked before the permitted-prefix gate. A file matching both lists always asks.
+- **rtk wrapper.** When [rtk](https://github.com/rtk-ai/rtk) is active, its hook auto-rewrites commands to `rtk <cmd>` (and `cat` to `rtk read`); `rtk proxy <cmd>` runs `<cmd>` verbatim. The read-only and jq carve-outs strip a leading `rtk`/`rtk proxy` before matching, so wrapped native commands reuse the existing `read-only-commands`/`jq-pipeline-helpers` entries. The deny/ask safety gates (`rm`, `dd`, `/proc`, truncation, sensitive files) scan the whole string, so the wrapper can't smuggle anything past them. rtk-specific read-only verbs (`read`, `gain`, …) are listed in `read-only-commands`.
 - **Sandbox toggle.** If `~/.claude/settings.json` has `"sandbox": {"enabled": true}`, the inline-exec ask is skipped (the sandbox confines blast radius). User-level Claude Code settings only — project/local overrides are intentionally ignored. This is the one path under `~/.claude/` the hook still reads.
 - **Uninstall.** Remove the `PreToolUse` entry from `~/.claude/settings.json`. The clone itself does nothing without the hook wiring.
 - **Debug.** Run Claude Code with `--debug` to see each decision's `permissionDecisionReason`.
+
+## `/audit-permissions` — find over-permissive config
+
+The counterpart to Claude Code's `/fewer-permission-prompts`. That command scans transcripts and *adds* allowlist entries to cut down on prompts; this one inspects what's already granted — across the `settings.json` files and `~/.claudeperms/` — and flags entries a rogue or prompt-injected agent could exploit to escalate. It reports findings by severity and proposes tightenings; **it never edits config itself**.
+
+It looks for five avenues:
+
+- **Arbitrary execution** — `permissions.allow` Bash rules that grant a shell or run code (interpreters like `Bash(node:*)`, wrappers like `Bash(env:*)`, lifecycle/build tools, broad `Bash(git:*)`/`Bash(docker:*)`), plus `enableAllProjectMcpServers`.
+- **Guardrails disabled** — `defaultMode: bypassPermissions`/`acceptEdits`, the claude-perms PreToolUse hook not wired at all, empty `inline-exec-patterns`, or trash disabled.
+- **Self-modification** — write rules over `.claude/`, `.claudeperms/`, `CLAUDE.md`, hooks/skills; broad `additionalDirectories`; an `ask-before-write` list that's empty or negates its own protections.
+- **Secret exfiltration** — read rules over `~/.ssh`/`.env`/credentials, an empty `ask-before-read`, or `approved-domains.json` entries that approve multi-tenant hosts or request-catcher endpoints.
+- **Sandbox / path-gate escape** — exec-capable commands mislabelled in `read-only-commands` or `jq-pipeline-helpers`, or over-broad `write-permitted-prefixes`/`permitted-paths`.
+
+It's a **pure-prompt skill** (no script): it reads `permissions.mjs` first so its judgements reflect how the gates actually interact today — for example, that `ask-before-write` is checked before the path gate, so a `permitted-paths` entry the write-gate already covers is not a hole. Treat its output as a heuristic review, not a proof of safety. Install with:
+
+```sh
+npm run setup:skill
+```
+
+`setup:skill` installs every skill under `defaults/skills/` (currently `/audit-permissions` and `/check-for-prompt-injection`) into `~/.claude/skills/`, overwriting installed copies.
 
 ## `check-malicious` — isolated injection-resistant code review
 
@@ -109,12 +131,12 @@ A Claude Code skill that nudges the assistant to run the scan before committing 
 npm run setup:skill
 ```
 
-This copies `defaults/skills/check-for-prompt-injection/SKILL.md` into `~/.claude/skills/check-for-prompt-injection/`. The skill is then invokable as `/check-for-prompt-injection`, and its description allows Claude to auto-pick it up around commit-time. Re-running `setup:skill` overwrites the installed copy — edit it in place if you want a customised version.
+`setup:skill` installs every skill under `defaults/skills/`, so this copies `check-for-prompt-injection/SKILL.md` into `~/.claude/skills/check-for-prompt-injection/`. The skill is then invokable as `/check-for-prompt-injection`, and its description allows Claude to auto-pick it up around commit-time. Re-running `setup:skill` overwrites the installed copy — edit it in place if you want a customised version.
 
 How it isolates:
 
 - **Deterministic pre-check.** Before the LLM ever runs, input is scanned with [`anti-trojan-source`](https://github.com/lirantal/anti-trojan-source) for bidi overrides, zero-width characters, tag chars, and other confusables. Any hit short-circuits with `FAIL\nBidi characters present` (exit 1) — no LLM round-trip, and no way for a prompt-injected diff to talk the reviewer out of failing.
-- Invokes `claude --disable-slash-commands --setting-sources '' --strict-mcp-config --mcp-config '{"mcpServers":{}}' --tools ''` so settings, hooks, MCP servers, skills, and tools cannot influence the reviewer. (`--bare` is intentionally omitted because it disables OAuth/keychain auth and would require every user to set `ANTHROPIC_API_KEY`; the safety contract relies on the random nonce + exact-match check, not `--bare`.)
+- Invokes `claude --disable-slash-commands --setting-sources '' --strict-mcp-config --mcp-config '{"mcpServers":{}}' --tools ''` so the reviewer runs without slash-command skills, settings.json (and hooks declared there), MCP servers, or built-in tools. **Caveat:** `--bare` is intentionally omitted (it disables OAuth/keychain auth, which would force every user to set `ANTHROPIC_API_KEY`), so `~/.claude/CLAUDE.md`, cwd CLAUDE.md, auto-memory, and `~/.claude/hooks/` can still influence the reviewer. The safety contract that actually holds is the random per-invocation nonce + exact-match check, not the flag list.
 - The "safe" signal is a per-invocation random nonce (`SAFE-<32hex>`) embedded only in the system prompt. Diff content can't see it, so an injected diff can't forge the safe signal.
 - Output is checked via exact-match on `trim()`: only a response that is *just* the nonce counts as safe. Anything else fails.
 - Reviewer natural-language output is written to a log file under `$TMPDIR/claudeperms-checks/` — it never reaches stdout, so a successful content-channel injection can't cascade into the caller.

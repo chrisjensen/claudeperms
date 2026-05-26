@@ -1,12 +1,20 @@
 #!/usr/bin/env node
+// NOT FOOLPROOF. This script raises the bar for prompt-injection attacks but does
+// not eliminate them. A well-crafted payload could still talk the reviewer LLM
+// into emitting the safe nonce — the nonce mechanism makes accidental or
+// careless leakage hard, but a sufficiently sophisticated injection that
+// reasons about the review structure can still defeat it. Treat a PASS as
+// "no obvious problems found", not "proven safe".
+//
 // Reads code/diff from stdin and screens it for malicious content in two stages:
 //   1. Deterministic unicode-attack pre-check via anti-trojan-source. Fails fast
 //      with `FAIL\nBidi characters present` if any bidi/zero-width/tag/confusable
 //      character is found — no LLM round-trip.
-//   2. Otherwise invokes Claude in maximally-isolated mode to review for the
-//      semantic categories (credential exfil, install hooks, eval/obfuscation,
-//      suspicious network). Reviewer output never cascades to the caller — only
-//      PASS or `FAIL\nReviewer output: <log>` reaches stdout.
+//   2. Otherwise invokes Claude in an isolated mode (no tools, no MCP, no
+//      settings, no slash commands) to review for the semantic categories
+//      (credential exfil, install hooks, eval/obfuscation, suspicious network).
+//      Reviewer output never cascades to the caller — only PASS or the FAIL
+//      template (with an LLM-warning about not reading the log) reaches stdout.
 //
 // Usage:  git diff main...HEAD | check-malicious.mjs
 // Exit codes:  0 safe  1 concerns  2 empty input  3 reviewer invocation failed
@@ -46,8 +54,13 @@ async function runReviewer(systemPrompt, diff) {
 
   return new Promise((resolve, reject) => {
     // `--bare` is intentionally omitted: it disables OAuth/keychain auth and
-    // requires ANTHROPIC_API_KEY, which most users don't set. The isolation
-    // contract relies on the random nonce + exact-match check, not on --bare.
+    // requires ANTHROPIC_API_KEY, which most users don't set. Without it,
+    // `~/.claude/CLAUDE.md`, cwd CLAUDE.md, auto-memory, and `~/.claude/hooks/`
+    // can still influence the reviewer — the flags below only block settings.json
+    // (and hooks declared there), MCP servers, built-in tools, and slash commands.
+    // The isolation contract that survives rests on the random per-invocation
+    // nonce + exact-match output check, which is what the safety guarantee
+    // actually relies on. See the NOT FOOLPROOF header for the broader caveats.
     const child = spawn(claudeBin, [
       '--disable-slash-commands',
       '--setting-sources', '',
