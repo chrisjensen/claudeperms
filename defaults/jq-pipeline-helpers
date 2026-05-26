@@ -4,6 +4,7 @@
 
 jq
 cat
+read
 curl
 head
 tail

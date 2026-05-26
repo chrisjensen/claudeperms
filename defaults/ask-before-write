@@ -1,6 +1,8 @@
 # Patterns that force an "ask before write" prompt — applies to Write/Edit
 # tools and to inferred Bash write targets (redirects, tee, sed -i, mv/cp).
-# Same pattern shapes as ask-before-read.
+# Same pattern shapes as ask-before-read, plus !pattern negation: a path
+# matched by a !-prefixed pattern is never gated, even if a positive pattern
+# also matches.
 
 .env
 .env.*
@@ -19,10 +21,13 @@ id_dsa
 ~/.config/gh/config.yml
 ~/.bash_history
 ~/.zsh_history
-CLAUDE.md
-~/.claude/skills/
-~/.claude/settings.json
-~/.claude/settings.local.json
-.claude/settings.json
-.claude/settings.local.json
 ~/.gitconfig
+CLAUDE.md
+# Blanket-gate any .claude/ directory — home or project-local. Catches
+# hooks/, agents/, commands/, plugins/, skills/, config/, settings.json,
+# .credentials.json, and any future subdirs Claude Code adds. Carve out
+# only ~/.claude/plans/ (Claude writes plan files there in plan mode).
+# Project plans/ is NOT carved out — a malicious repo could otherwise drop
+# behavior-modifying files there.
+.claude/
+!~/.claude/plans/

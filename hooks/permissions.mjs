@@ -95,14 +95,9 @@ function dispatch(input) {
 // === Bash =============================================================
 
 function checkBashCommand(command, cwd, opts = {}) {
-  // 1. Unconditional deletion
-  for (const pattern of DELETION_PATTERNS) {
-    if (pattern.test(command)) {
-      return deny(
-        'Deletion is not allowed. To remove files, use: `mv <file> .trash/` (the .trash/ directory will be created if needed)'
-      );
-    }
-  }
+  // 1. Deletion commands — gated by trash config.
+  const delResult = checkDeletion(command, cwd);
+  if (delResult) return delResult;
 
   // 2. Truncation redirects — deny only if target file exists
   const truncResult = checkTruncationRedirects(command, cwd);
@@ -208,6 +203,47 @@ function checkBashCommand(command, cwd, opts = {}) {
   return allow('Command passes all security checks.');
 }
 
+// --- Bash: deletion ---
+
+// Decision matrix:
+//   trash disabled                                  → ask
+//   trash enabled, every target inside trash dir   → ask  (emptying trash)
+//   trash enabled, mixed/outside/unparseable        → deny (use mv <f> <trash>)
+function checkDeletion(command, cwd) {
+  const matchesDeletion = DELETION_PATTERNS.some((p) => p.test(command));
+  if (!matchesDeletion) return null;
+
+  const { trashEnabled, trashLocation } = loadTrashConfig();
+
+  if (!trashEnabled) {
+    return ask(
+      'Deletion command detected and trash is disabled in ~/.claudeperms/config.json. ' +
+        'Approve only if intentional.'
+    );
+  }
+
+  const trashAbs = toAbs(trashLocation, cwd);
+  const targets = extractFileArgs(command, cwd);
+
+  if (targets.length === 0) return deny(denyDeletionMessage(trashLocation));
+
+  if (targets.every((t) => isInsideTrash(t, trashAbs))) {
+    return ask(
+      `Deletion targets are inside the trash directory (${trashLocation}). ` +
+        'Approve only if you intend to empty the trash.'
+    );
+  }
+
+  return deny(denyDeletionMessage(trashLocation));
+}
+
+function denyDeletionMessage(trashLocation) {
+  return (
+    `Deletion is not allowed. To remove files, use: \`mv <file> ${trashLocation}\` ` +
+      `(the ${trashLocation} directory will be created if needed)`
+  );
+}
+
 // --- Bash: truncation ---
 
 function checkTruncationRedirects(command, cwd) {
@@ -227,12 +263,29 @@ function checkTruncationRedirects(command, cwd) {
       ? cleanTarget
       : resolve(cwd || '.', cleanTarget);
 
-    if (existsSync(absoluteTarget)) {
-      return deny(
+    if (!existsSync(absoluteTarget)) continue;
+
+    const { trashEnabled, trashLocation } = loadTrashConfig();
+
+    if (!trashEnabled) {
+      return ask(
         `Redirect would truncate existing file: ${absoluteTarget}. ` +
-          'To remove files, use: `mv <file> .trash/`'
+          'Trash is disabled in ~/.claudeperms/config.json — approve only if intentional.'
       );
     }
+
+    const trashAbs = toAbs(trashLocation, cwd);
+    if (isInsideTrash(absoluteTarget, trashAbs)) {
+      return ask(
+        `Redirect would truncate a file inside the trash directory (${trashLocation}): ${absoluteTarget}. ` +
+          'Approve only if you intend to empty the trash.'
+      );
+    }
+
+    return deny(
+      `Redirect would truncate existing file: ${absoluteTarget}. ` +
+        `To remove files, use: \`mv <file> ${trashLocation}\``
+    );
   }
   return null;
 }
@@ -353,9 +406,9 @@ function matchesReadOnlyPrefix(segment, readOnlyPrefixes) {
   return false;
 }
 
-// Returns segment with env-var assignments, leading `env`, and `timeout DURATION`
-// stripped — keeps subcommand + args intact so `git log --oneline` still matches
-// the `git log` prefix.
+// Returns segment with env-var assignments, leading `env`, `timeout DURATION`,
+// and the rtk wrapper stripped — keeps subcommand + args intact so
+// `git log --oneline` still matches the `git log` prefix.
 function stripCommandPrefixes(segment) {
   let s = segment.trim();
   while (true) {
@@ -373,9 +426,26 @@ function stripCommandPrefixes(segment) {
       s = s.slice(timeoutM[0].length);
       continue;
     }
+    if (stripRtkWrapper(s) !== s) {
+      s = stripRtkWrapper(s);
+      continue;
+    }
     break;
   }
   return s;
+}
+
+// rtk (https://github.com/rtk-ai/rtk) is a transparent output-filtering proxy.
+// Its Claude Code hook auto-rewrites commands segment-by-segment — `git status`
+// becomes `rtk git status` — and `rtk proxy <cmd>` runs <cmd> verbatim. Strip
+// the wrapper so the underlying command is what the carve-outs evaluate.
+// Returns the input unchanged when there is no rtk wrapper (used as the
+// loop sentinel by stripCommandPrefixes/leadingCommand).
+function stripRtkWrapper(s) {
+  if (!s.startsWith('rtk ')) return s;
+  let rest = s.slice(4).trim();
+  if (rest.startsWith('proxy ')) rest = rest.slice(6).trim();
+  return rest;
 }
 
 // `gh api` defaults to GET but can mutate via:
@@ -467,6 +537,7 @@ function leadingCommand(segment) {
     if (s.startsWith('env ')) { s = s.slice(4).trim(); continue; }
     const assign = /^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/.exec(s);
     if (assign) { s = s.slice(assign[0].length); continue; }
+    if (stripRtkWrapper(s) !== s) { s = stripRtkWrapper(s); continue; }
     break;
   }
   const m = /^"([^"]*)"|^'([^']*)'|^(\S+)/.exec(s);
@@ -514,6 +585,28 @@ function checkWebFetch(url) {
     `URL not in approved list: ${url}. ` +
       `Add to ~/.claudeperms/approved-domains.json under "domains" (single-tenant host) or "urlPrefixes" (multi-tenant path).`
   );
+}
+
+// Reads ~/.claudeperms/config.json. Missing/malformed/!enabled/no location → trash disabled.
+// Returns { trashEnabled, trashLocation } — location is the raw configured string
+// (resolve at the call site via toAbs(location, cwd)).
+function loadTrashConfig() {
+  const disabled = { trashEnabled: false, trashLocation: null };
+  const path = join(homedir(), '.claudeperms', 'config.json');
+  if (!existsSync(path)) return disabled;
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    const trash = parsed?.trash;
+    if (!trash || trash.enabled !== true) return disabled;
+    const location =
+      typeof trash.location === 'string' && trash.location.length > 0
+        ? trash.location
+        : null;
+    if (!location) return disabled;
+    return { trashEnabled: true, trashLocation: location };
+  } catch {
+    return disabled;
+  }
 }
 
 // Reads ~/.claudeperms/approved-domains.json. Missing or unparseable → empty lists.
@@ -613,6 +706,15 @@ function toAbs(p, cwd) {
   return resolve(cwd || '.', p);
 }
 
+// True iff absPath is the trash dir itself OR sits inside it.
+// trashLocationAbs must already be absolute (caller resolves via toAbs).
+function isInsideTrash(absPath, trashLocationAbs) {
+  if (!trashLocationAbs) return false;
+  const trashRoot = trashLocationAbs.replace(/\/+$/, '');
+  if (absPath === trashRoot) return true;
+  return absPath.startsWith(trashRoot + '/');
+}
+
 function isPathPermitted(absPath, cwd) {
   if (cwd && absPath.startsWith(cwd)) return true;
   for (const permitted of loadPermittedPaths()) {
@@ -623,13 +725,21 @@ function isPathPermitted(absPath, cwd) {
 
 // --- Sensitive file matching ---
 
+// A path is sensitive iff at least one positive pattern matches AND no
+// negation (!-prefixed) pattern matches. Negation wins regardless of order,
+// so `!~/.claude/plans/` can carve a hole out of a broader `.claude/` rule.
 function isSensitiveFile(absFilePath, kind) {
   if (!absFilePath) return false;
   const name = kind === 'write' ? 'ask-before-write' : 'ask-before-read';
+  let matched = false;
   for (const pattern of loadList(name)) {
-    if (matchesSensitivePattern(absFilePath, pattern)) return true;
+    if (pattern.startsWith('!')) {
+      if (matchesSensitivePattern(absFilePath, pattern.slice(1))) return false;
+    } else if (matchesSensitivePattern(absFilePath, pattern)) {
+      matched = true;
+    }
   }
-  return false;
+  return matched;
 }
 
 // Match a file path against a single pattern.

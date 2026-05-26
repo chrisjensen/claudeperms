@@ -142,3 +142,17 @@ npm show
 npm ls
 npm outdated
 npm config get
+
+# rtk (https://github.com/rtk-ai/rtk) read-only subcommands. The hook strips the
+# `rtk`/`rtk proxy` wrapper before matching, so wrapped native commands reuse the
+# entries above (rtk git status → git status, rtk ls → ls, rtk grep → grep, …).
+# Listed here are rtk-specific verbs that don't map onto a native entry:
+#   read  → rtk's replacement for `cat` (the auto-rewrite turns `cat` into `rtk read`)
+#   the rest are read-only rtk utilities / meta commands.
+read
+smart
+gain
+discover
+deps
+json
+cc-economics

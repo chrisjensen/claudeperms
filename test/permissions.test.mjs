@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runHook } from './_helpers.mjs';
@@ -51,6 +51,87 @@ describe('Bash: denials', () => {
       },
     });
     assert.notEqual(r.decision, 'deny');
+  });
+});
+
+describe('Bash: trash handling', () => {
+  test('rm outside trash still denies (defaults: trash enabled)', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'rm /tmp/foo' }, cwd: '/tmp' },
+    });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /Deletion is not allowed/);
+  });
+
+  test('rm targeting a path inside trash asks (emptying trash)', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'rm /tmp/.trash/old' }, cwd: '/tmp' },
+    });
+    assert.equal(r.decision, 'ask');
+    assert.match(r.reason, /inside the trash/);
+  });
+
+  test('rm with trash explicitly disabled asks instead of denying', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'rm /tmp/foo' }, cwd: '/tmp' },
+      files: { 'config.json': JSON.stringify({ trash: { enabled: false, location: '.trash/' } }) },
+    });
+    assert.equal(r.decision, 'ask');
+    assert.match(r.reason, /trash is disabled/i);
+  });
+
+  test('rm with no config.json (seedDefaults: false) asks (trash disabled by missing-file rule)', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'rm /tmp/foo' }, cwd: '/tmp' },
+      seedDefaults: false,
+    });
+    assert.equal(r.decision, 'ask');
+    assert.match(r.reason, /trash is disabled/i);
+  });
+
+  test('rm with mixed targets (one inside trash, one outside) denies', async () => {
+    const r = await runHook({
+      input: {
+        tool_name: 'Bash',
+        tool_input: { command: 'rm /tmp/.trash/old /tmp/keepme' },
+        cwd: '/tmp',
+      },
+    });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /Deletion is not allowed/);
+  });
+
+  test('truncation redirect targeting a file inside trash asks', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cp-trash-trunc-'));
+    const trashDir = join(dir, '.trash');
+    const target = join(trashDir, 'marker');
+    mkdirSync(trashDir);
+    writeFileSync(target, '');
+    try {
+      const r = await runHook({
+        input: { tool_name: 'Bash', tool_input: { command: `: > ${target}` }, cwd: dir },
+        files: {
+          'config.json': JSON.stringify({ trash: { enabled: true, location: '.trash/' } }),
+        },
+      });
+      assert.equal(r.decision, 'ask');
+      assert.match(r.reason, /inside the trash/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('absolute trash location (~/trash/) is recognised', async () => {
+    const r = await runHook({
+      input: {
+        tool_name: 'Bash',
+        tool_input: { command: 'rm ~/trash/old' },
+        cwd: '/tmp',
+      },
+      files: { 'config.json': JSON.stringify({ trash: { enabled: true, location: '~/trash/' } }) },
+    });
+    assert.equal(r.decision, 'ask');
+    assert.match(r.reason, /inside the trash/);
   });
 });
 
@@ -203,6 +284,54 @@ describe('Bash: allow and carve-outs', () => {
   });
 });
 
+describe('Bash: rtk wrapper', () => {
+  // rtk's hook auto-rewrites read-only commands to `rtk <cmd>`; the carve-outs
+  // must unwrap that prefix so the underlying command still matches.
+  test('rtk git log keeps the read-only carve-out (sandbox disabled)', async () => {
+    const r = await runHook({
+      input: {
+        tool_name: 'Bash',
+        tool_input: { command: 'rtk git log --oneline', dangerouslyDisableSandbox: true },
+        cwd: '/tmp',
+      },
+    });
+    assert.equal(r.decision, 'allow');
+    assert.match(r.reason, /Read-only command/);
+  });
+
+  test('rtk gain (rtk-native read-only verb) carves out (sandbox disabled)', async () => {
+    const r = await runHook({
+      input: {
+        tool_name: 'Bash',
+        tool_input: { command: 'rtk gain --history', dangerouslyDisableSandbox: true },
+        cwd: '/tmp',
+      },
+    });
+    assert.equal(r.decision, 'allow');
+    assert.match(r.reason, /Read-only command/);
+  });
+
+  test('rtk read piped into jq keeps the jq carve-out (cat is rewritten to rtk read)', async () => {
+    const r = await runHook({
+      input: {
+        tool_name: 'Bash',
+        tool_input: { command: 'rtk read data.json | jq .' },
+        cwd: '/tmp',
+      },
+    });
+    assert.equal(r.decision, 'allow');
+    assert.match(r.reason, /jq/);
+  });
+
+  test('rtk proxy does not smuggle a deletion past the deny gate', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'rtk proxy rm /tmp/foo' }, cwd: '/tmp' },
+    });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /Deletion is not allowed/);
+  });
+});
+
 describe('WebFetch', () => {
   test('default-approved domain allows (no user file)', async () => {
     const r = await runHook({
@@ -321,6 +450,80 @@ describe('Pattern matcher shapes', () => {
       },
     });
     assert.equal(r.decision, 'ask');
+  });
+});
+
+describe('.claude/ blanket write gate', () => {
+  test('home: writing under ~/.claude/hooks/ asks', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Write', tool_input: { file_path: '~/.claude/hooks/x.sh' }, cwd: '/tmp' },
+    });
+    assert.equal(r.decision, 'ask');
+  });
+
+  test('project: writing under <repo>/.claude/hooks/ asks', async () => {
+    const r = await runHook({
+      input: {
+        tool_name: 'Write',
+        tool_input: { file_path: '/tmp/evil-repo/.claude/hooks/x.sh' },
+        cwd: '/tmp/evil-repo',
+      },
+    });
+    assert.equal(r.decision, 'ask');
+  });
+
+  test('home: writing under ~/.claude/plans/ allows (carve-out)', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Write', tool_input: { file_path: '~/.claude/plans/x.md' }, cwd: '/tmp' },
+    });
+    assert.equal(r.decision, 'allow');
+  });
+
+  test('project: writing under <repo>/.claude/plans/ still asks (carve-out is home-anchored)', async () => {
+    const r = await runHook({
+      input: {
+        tool_name: 'Write',
+        tool_input: { file_path: '/tmp/evil-repo/.claude/plans/x.md' },
+        cwd: '/tmp/evil-repo',
+      },
+    });
+    assert.equal(r.decision, 'ask');
+  });
+
+  test('memory writes ask (behavior-modifying, not carved out)', async () => {
+    const r = await runHook({
+      input: {
+        tool_name: 'Write',
+        tool_input: { file_path: '~/.claude/projects/foo/memory/user.md' },
+        cwd: '/tmp',
+      },
+    });
+    assert.equal(r.decision, 'ask');
+  });
+
+  test('credential read asks', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Read', tool_input: { file_path: '~/.claude/.credentials.json' } },
+    });
+    assert.equal(r.decision, 'ask');
+  });
+});
+
+describe('Pattern matcher: negation', () => {
+  test('positive match cancelled by !pattern regardless of order', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Write', tool_input: { file_path: '/tmp/x/safe.txt' }, cwd: '/tmp/x' },
+      files: { 'ask-before-write': '/tmp/x/\n!/tmp/x/safe.txt\n' },
+    });
+    assert.equal(r.decision, 'allow');
+  });
+
+  test('!pattern listed before positive still wins', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Write', tool_input: { file_path: '/tmp/x/safe.txt' }, cwd: '/tmp/x' },
+      files: { 'ask-before-write': '!/tmp/x/safe.txt\n/tmp/x/\n' },
+    });
+    assert.equal(r.decision, 'allow');
   });
 });
 

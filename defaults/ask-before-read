@@ -23,3 +23,6 @@ id_dsa
 ~/.config/gh/config.yml
 ~/.bash_history
 ~/.zsh_history
+# Anthropic OAuth token lives at ~/.claude/.credentials.json. Bare-basename
+# match also catches the .backup sibling.
+.credentials.json
