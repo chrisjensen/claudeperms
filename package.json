@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "setup": "mkdir -p ~/.claudeperms && cp hooks/permissions.mjs ~/.claudeperms/permissions.mjs && cp hooks/check-malicious.mjs ~/.claudeperms/check-malicious.mjs && chmod 0755 ~/.claudeperms/check-malicious.mjs && find defaults -maxdepth 1 -type f ! -name claudeperms-package.json -exec cp -n {} ~/.claudeperms/ \\; && cp -n defaults/claudeperms-package.json ~/.claudeperms/package.json && (cd ~/.claudeperms && npm install --omit=dev --no-audit --no-fund)",
+    "setup": "sh scripts/setup.sh",
     "setup:skill": "for d in defaults/skills/*/; do n=$(basename \"$d\"); mkdir -p ~/.claude/skills/\"$n\" && cp \"${d}SKILL.md\" ~/.claude/skills/\"$n\"/SKILL.md; done"
   },
   "engines": {
