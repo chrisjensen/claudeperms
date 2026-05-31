@@ -599,3 +599,103 @@ describe('Empty defaults (seedDefaults: false)', () => {
     assert.doesNotMatch(r.reason, /Read-only command/);
   });
 });
+
+describe('Research mode', () => {
+  const RESEARCH = { CLAUDE_PERMS_MODE: 'research' };
+
+  test('Bash denied even for trivially safe commands', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'ls' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /^\[research mode\] /);
+    assert.match(r.reason, /Execution-class/);
+  });
+
+  test('Agent denied (sub-agents could escalate)', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Agent', tool_input: { prompt: 'go research' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /^\[research mode\] /);
+  });
+
+  test('MCP tools denied (representative mcp__* name)', async () => {
+    const r = await runHook({
+      input: { tool_name: 'mcp__playwright__browser_click', tool_input: {}, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /^\[research mode\] /);
+  });
+
+  test('WebFetch allowed unconditionally (domain allowlist skipped)', async () => {
+    const r = await runHook({
+      input: {
+        tool_name: 'WebFetch',
+        tool_input: { url: 'https://random-blog.example/post' },
+        cwd: '/tmp',
+      },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'allow');
+    assert.match(r.reason, /^\[research mode\] /);
+    assert.match(r.reason, /unconditional/i);
+  });
+
+  test('Write under cwd allowed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cp-research-cwd-'));
+    try {
+      const r = await runHook({
+        input: {
+          tool_name: 'Write',
+          tool_input: { file_path: join(dir, 'notes.md'), content: '' },
+          cwd: dir,
+        },
+        env: RESEARCH,
+      });
+      assert.equal(r.decision, 'allow');
+      assert.match(r.reason, /^\[research mode\] /);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('Write under /tmp allowed ($TMPDIR carve-out)', async () => {
+    const r = await runHook({
+      input: {
+        tool_name: 'Write',
+        tool_input: { file_path: '/tmp/research-scratch.md', content: '' },
+        cwd: '/home/chris/work',
+      },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'allow');
+  });
+
+  test('Write to ~/src/ denied (write-permitted-prefixes bypassed)', async () => {
+    // Default mode permits this via write-permitted-prefixes; research mode does not.
+    const r = await runHook({
+      input: {
+        tool_name: 'Write',
+        tool_input: { file_path: '/home/chris/src/foo.md', content: '' },
+        cwd: '/tmp',
+      },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /^\[research mode\] /);
+    assert.match(r.reason, /outside research-mode write scope/);
+  });
+
+  test('default mode (env var unset) still allows Bash ls (opt-in only)', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'ls' }, cwd: '/tmp' },
+      // no env override
+    });
+    assert.equal(r.decision, 'allow');
+    assert.doesNotMatch(r.reason, /research mode/);
+  });
+});

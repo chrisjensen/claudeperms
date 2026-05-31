@@ -13,14 +13,15 @@
 // Layout (top-down):
 //   1. Imports + constants
 //   2. main() and the per-tool dispatcher
-//   3. Bash: checkBashCommand + all of its helpers
-//   4. WebFetch: checkWebFetch + approved-domains loader
-//   5. File tools: checkFileToolAccess, checkGlobOrGrep
-//   6. Shared utilities: decisions, path/sensitive-file matching, config loaders
+//   3. Research mode: env-var-gated tighter posture for web crawling
+//   4. Bash: checkBashCommand + all of its helpers
+//   5. WebFetch: checkWebFetch + approved-domains loader
+//   6. File tools: checkFileToolAccess, checkGlobOrGrep
+//   7. Shared utilities: decisions, path/sensitive-file matching, config loaders
 
 import { readFileSync, existsSync } from 'fs';
 import { join, resolve } from 'path';
-import { homedir } from 'os';
+import { homedir, tmpdir } from 'os';
 
 // === Constants ========================================================
 //
@@ -73,6 +74,8 @@ async function main() {
 }
 
 function dispatch(input) {
+  if (isResearchMode()) return dispatchResearchMode(input);
+
   const { tool_name, tool_input, cwd } = input;
 
   if (tool_name === 'Bash') {
@@ -90,6 +93,109 @@ function dispatch(input) {
     return checkGlobOrGrep(tool_name, tool_input, cwd);
   }
   return allow(`Tool ${tool_name} is not subject to permission checks.`);
+}
+
+// === Research mode ====================================================
+//
+// Activated by CLAUDE_PERMS_MODE=research in the shell that launches `claude`.
+// The PreToolUse hook process inherits that env var. A hook `deny` overrides
+// any `settings.json` `allow` rule (including bypassPermissions), so this
+// short-circuit is sufficient — no settings.json coordination needed.
+//
+// Threat model: prompt injection in fetched pages talking the assistant into
+// running a shell command, spawning a sub-agent, or calling a mutating MCP
+// tool. Mitigations:
+//   - Hard-deny Bash, Agent, and every mcp__* tool.
+//   - Restrict writes to cwd or $TMPDIR/`/tmp/` only — ignore the
+//     permitted-paths and write-permitted-prefixes lists (so injected content
+//     can't reach ~/src/ or other normally-writable areas).
+//   - Allow WebFetch unconditionally (the whole point of research mode is
+//     wide crawling; per-domain asks defeat that).
+//   - Keep the existing read gate as-is (ask-before-read still applies).
+//
+// Every decision reason is prefixed `[research mode] ` so it's visible in
+// `claude --debug` and in interactive prompts.
+
+const RESEARCH_REASON_PREFIX = '[research mode] ';
+
+function isResearchMode() {
+  return process.env.CLAUDE_PERMS_MODE === 'research';
+}
+
+function dispatchResearchMode(input) {
+  const { tool_name, tool_input, cwd } = input;
+
+  if (tool_name === 'Bash' || tool_name === 'Agent' || tool_name.startsWith('mcp__')) {
+    return researchDeny(
+      `Execution-class tool (${tool_name}) is disabled in research mode. ` +
+        'Restart without CLAUDE_PERMS_MODE=research to use it.'
+    );
+  }
+
+  if (tool_name === 'WebFetch') {
+    return researchAllow('WebFetch is unconditional in research mode (domain allowlist skipped).');
+  }
+
+  if (tool_name === 'Write' || tool_name === 'Edit' || tool_name === 'NotebookEdit') {
+    return checkResearchWrite(tool_name, tool_input, cwd);
+  }
+
+  if (tool_name === 'Read' || tool_name === 'Glob' || tool_name === 'Grep') {
+    const inner = tool_name === 'Read'
+      ? checkFileToolAccess(tool_name, tool_input, cwd)
+      : checkGlobOrGrep(tool_name, tool_input, cwd);
+    return prefixResearchReason(inner);
+  }
+
+  return researchAllow(`Tool ${tool_name} permitted in research mode (local state only).`);
+}
+
+// Research-mode write gate: target must resolve under cwd or $TMPDIR/`/tmp/`.
+// Sensitive-write list still applies (it returns ask, not allow, so it
+// tightens — never loosens — the research posture).
+function checkResearchWrite(toolName, toolInput, cwd) {
+  const filePath = toolInput?.file_path ?? '';
+  if (!filePath) {
+    return researchDeny(`${toolName} called without a file_path in research mode.`);
+  }
+  const absPath = toAbs(filePath, cwd);
+
+  if (isSensitiveFile(absPath, 'write')) {
+    return researchAsk(
+      `${toolName} targets a sensitive file: ${absPath}. Approve only if intentional.`
+    );
+  }
+
+  if (!isResearchWritableTarget(absPath, cwd)) {
+    return researchDeny(
+      `${toolName} target outside research-mode write scope (cwd or $TMPDIR): ${absPath}.`
+    );
+  }
+
+  return researchAllow(`${toolName} target is inside research-mode write scope.`);
+}
+
+function isResearchWritableTarget(absPath, cwd) {
+  if (cwd && (absPath === cwd || absPath.startsWith(cwd + '/'))) return true;
+  const tmp = tmpdir().replace(/\/+$/, '');
+  if (absPath === tmp || absPath.startsWith(tmp + '/')) return true;
+  // Cover /tmp/ explicitly in case $TMPDIR points elsewhere (macOS, sandboxes).
+  if (absPath === '/tmp' || absPath.startsWith('/tmp/')) return true;
+  return false;
+}
+
+function researchAllow(reason) { return decision('allow', RESEARCH_REASON_PREFIX + reason); }
+function researchDeny(reason)  { return decision('deny',  RESEARCH_REASON_PREFIX + reason); }
+function researchAsk(reason)   { return decision('ask',   RESEARCH_REASON_PREFIX + reason); }
+
+// Re-wrap a decision produced by the shared (non-research) checkers so its
+// reason carries the research prefix, without re-deriving the verdict.
+function prefixResearchReason(d) {
+  const inner = d?.hookSpecificOutput ?? {};
+  return decision(
+    inner.permissionDecision,
+    RESEARCH_REASON_PREFIX + (inner.permissionDecisionReason ?? '')
+  );
 }
 
 // === Bash =============================================================

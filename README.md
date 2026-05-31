@@ -65,6 +65,48 @@ Unknown tools are not gated. Regex safety gates (`rm`, truncation, `dd`, `/proc`
    # expect: "permissionDecision":"deny"
    ```
 
+## Research mode
+
+A second posture for sessions where the assistant should crawl widely (web research, source review) but never execute. Off by default; activated by an environment variable inherited from the launching shell. Mitigates prompt-injection from fetched pages by hard-denying every execution-class tool — a hook `deny` overrides any `settings.json` `allow` rule, including `bypassPermissions`.
+
+```sh
+CLAUDE_PERMS_MODE=research claude
+```
+
+Or with an alias (drop into `~/.bashrc` / `~/.zshrc`):
+
+```sh
+alias claude-research='CLAUDE_PERMS_MODE=research claude'
+```
+
+What changes in research mode:
+
+| Tool | Decision |
+|---|---|
+| `Bash`, `Agent`, any `mcp__*` | **deny** (execution-class) |
+| `WebFetch` | allow (domain allowlist skipped) |
+| `Write` / `Edit` / `NotebookEdit` | allow only inside `cwd` or `$TMPDIR`/`/tmp/`; the `ask-before-write` sensitive-file gate still applies. `permitted-paths` and `write-permitted-prefixes` are **ignored** — research mode does not let you write to `~/src/` even though default mode does. |
+| `Read` / `Glob` / `Grep` | existing read gate (`ask-before-read`, `read-permitted-prefixes`) |
+| `WebSearch`, `TodoWrite`, `TaskCreate`, `Skill`, … | allow (local state only) |
+
+Every decision reason is prefixed `[research mode]` so it's obvious in `claude --debug` output and in interactive prompts.
+
+### Status-line indicator (ccstatusline)
+
+Add a CustomCommand widget to `~/.config/ccstatusline/settings.json` to show a `🔬 RESEARCH` chip whenever the env var is set. `CustomCommandWidget` passes `process.env` through to the shell, so the chip toggles on automatically per session. Append it as the **last item** on the first line (after the trailing separator) so that when inactive, ccstatusline's trailing-separator trim cleans up the line:
+
+```json
+{
+  "id": "research-mode-indicator",
+  "type": "custom-command",
+  "color": "brightYellow",
+  "commandPath": "[ \"$CLAUDE_PERMS_MODE\" = \"research\" ] && printf '🔬 RESEARCH' || true",
+  "preserveColors": false
+}
+```
+
+When the env var is unset, the command emits nothing; ccstatusline drops empty-content widgets and then strips trailing separators, so the line ends cleanly at the previous widget.
+
 ## Customise
 
 All config lives under `~/.claudeperms/`. Each file is one entry per line (`#` for comments, `~/` expands to `$HOME`); `approved-domains.json` is JSON. **If a file is missing the list is empty** — see the per-file effect below.

@@ -29,9 +29,12 @@ const DEFAULTS_DIR = join(REPO_ROOT, 'defaults');
 //                 "settings.json" → <HOME>/.claude/; everything else → <HOME>/.claudeperms/.
 //                 Overrides any defaults-seeded file of the same name.
 //   seedDefaults  copy <repo>/defaults/* into <HOME>/.claudeperms/ first (default true)
+//   env           extra env vars merged into the spawned hook's process.env
+//                 (CLAUDE_PERMS_MODE is stripped from the default env so a host
+//                 shell that sets it can't leak into default-mode tests).
 //
 // Returns { decision, reason, raw, home }.
-export async function runHook({ input, rawInput, files = {}, seedDefaults = true } = {}) {
+export async function runHook({ input, rawInput, files = {}, seedDefaults = true, env = {} } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'claude-perms-test-'));
   try {
     const claudePermsDir = join(home, '.claudeperms');
@@ -52,8 +55,12 @@ export async function runHook({ input, rawInput, files = {}, seedDefaults = true
       writeFileSync(join(targetDir, name), contents);
     }
 
+    const spawnEnv = { ...process.env, HOME: home };
+    delete spawnEnv.CLAUDE_PERMS_MODE;
+    Object.assign(spawnEnv, env);
+
     const child = spawn(process.execPath, [HOOK_PATH], {
-      env: { ...process.env, HOME: home },
+      env: spawnEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
