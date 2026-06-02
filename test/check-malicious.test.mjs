@@ -132,7 +132,9 @@ describe('check-malicious', () => {
     // the deterministic path short-circuited before the reviewer.
     const { exitCode, stdout } = await runCheck(malicious, 'emit-nonce');
     assert.equal(exitCode, 1);
-    assert.equal(stdout.trim(), 'FAIL\nBidi characters present');
+    assert.match(stdout, /^FAIL\nBidi characters present/);
+    // detail line proves the deterministic pre-check ran (not the LLM stub)
+    assert.match(stdout, /RIGHT-TO-LEFT OVERRIDE/);
   });
 
   test('reviewer output never leaks to stdout on failure', async () => {
