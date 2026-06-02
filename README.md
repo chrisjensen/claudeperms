@@ -83,11 +83,17 @@ What changes in research mode:
 
 | Tool | Decision |
 |---|---|
-| `Bash`, `Agent`, any `mcp__*` | **deny** (execution-class) |
+| `Bash` — arbitrary | **deny** |
+| `Bash` — `ls`, `find` (no `-exec`/`-execdir`/`-delete`), `grep`/`egrep`/`fgrep`, `rg`; pipelines where every segment is from that set or `sort`/`uniq`/`wc`/`head`/`tail`/`cut`; no `$(...)`/backticks/redirects | **allow** |
+| any `mcp__*` | **deny** (execution-class) |
+| `Agent` | allow ¹ |
 | `WebFetch` | allow (domain allowlist skipped) |
 | `Write` / `Edit` / `NotebookEdit` | allow only inside `cwd` or `$TMPDIR`/`/tmp/`; the `ask-before-write` sensitive-file gate still applies. `permitted-paths` and `write-permitted-prefixes` are **ignored** — research mode does not let you write to `~/src/` even though default mode does. |
 | `Read` / `Glob` / `Grep` | existing read gate (`ask-before-read`, `read-permitted-prefixes`) |
 | `WebSearch`, `TodoWrite`, `TaskCreate`, `Skill`, … | allow (local state only) |
+
+¹ `Agent` itself executes no code; subagent tool calls still pass through this hook, so `Bash`/`mcp__*` remain blocked inside subagents.
+
 
 Every decision reason is prefixed `[research mode]` so it's obvious in `claude --debug` output and in interactive prompts.
 

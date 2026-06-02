@@ -103,9 +103,15 @@ function dispatch(input) {
 // short-circuit is sufficient — no settings.json coordination needed.
 //
 // Threat model: prompt injection in fetched pages talking the assistant into
-// running a shell command, spawning a sub-agent, or calling a mutating MCP
-// tool. Mitigations:
-//   - Hard-deny Bash, Agent, and every mcp__* tool.
+// running a shell command or calling a mutating MCP tool. Mitigations:
+//   - Hard-deny Bash except a narrow set of read-only filesystem commands
+//     (ls, find without -exec/-execdir/-delete, grep, rg). Pipes are allowed
+//     only if every segment is also from that safe set or a read-only
+//     transformer (sort, uniq, wc, head, tail, cut). Command substitution
+//     and redirects are always denied.
+//   - Hard-deny every mcp__* tool.
+//   - Agent is allowed: subagent tool calls still go through this hook, so
+//     Bash/MCP remain blocked inside subagents. Agent itself executes no code.
 //   - Restrict writes to cwd or $TMPDIR/`/tmp/` only — ignore the
 //     permitted-paths and write-permitted-prefixes lists (so injected content
 //     can't reach ~/src/ or other normally-writable areas).
@@ -122,10 +128,56 @@ function isResearchMode() {
   return process.env.CLAUDE_PERMS_MODE === 'research';
 }
 
+// Commands allowed as the root of a research-mode Bash call.
+const RESEARCH_ROOT_COMMANDS = new Set(['ls', 'find', 'grep', 'egrep', 'fgrep', 'rg', 'head', 'tail']);
+// Commands allowed anywhere in a pipeline (root commands + read-only transformers).
+const RESEARCH_PIPELINE_COMMANDS = new Set([
+  ...RESEARCH_ROOT_COMMANDS,
+  'sort', 'uniq', 'wc', 'head', 'tail', 'cut',
+]);
+
+// Returns true iff the command is safe to run in research mode:
+//   - No command substitution ($(...) or backticks)
+//   - No redirects (> or <)
+//   - Root command is in RESEARCH_ROOT_COMMANDS
+//   - find may not use -exec, -execdir, or -delete
+//   - Every pipe segment's leading command is in RESEARCH_PIPELINE_COMMANDS
+function isResearchSafeBashCommand(command) {
+  if (!command) return false;
+  if (/\$\(|`/.test(command)) return false;       // command substitution
+  if (/[<>]/.test(command)) return false;          // redirects
+
+  const segments = command.split('|');
+  const rootCmd = stripRtkWrapper(segments[0].trim()).split(/\s+/)[0];
+
+  if (!RESEARCH_ROOT_COMMANDS.has(rootCmd)) return false;
+
+  if (rootCmd === 'find' && /-(exec|execdir|delete)\b/.test(segments[0])) return false;
+
+  for (let i = 1; i < segments.length; i++) {
+    const segCmd = stripRtkWrapper(segments[i].trim()).split(/\s+/)[0];
+    if (!RESEARCH_PIPELINE_COMMANDS.has(segCmd)) return false;
+  }
+
+  return true;
+}
+
 function dispatchResearchMode(input) {
   const { tool_name, tool_input, cwd } = input;
 
-  if (tool_name === 'Bash' || tool_name === 'Agent' || tool_name.startsWith('mcp__')) {
+  if (tool_name === 'Bash') {
+    const cmd = stripRtkWrapper(tool_input?.command ?? '');
+    if (isResearchSafeBashCommand(cmd)) {
+      return researchAllow(`read-only filesystem command allowed in research mode: ${cmd.split(/\s+/)[0]}`);
+    }
+    return researchDeny(
+      'Bash is restricted in research mode. Only ls, find (no -exec/-execdir/-delete), ' +
+      'grep, rg, and pipelines between those commands (plus sort/uniq/wc/head/tail/cut) are allowed. ' +
+      'No command substitution or redirects.'
+    );
+  }
+
+  if (tool_name.startsWith('mcp__')) {
     return researchDeny(
       `Execution-class tool (${tool_name}) is disabled in research mode. ` +
         'Restart without CLAUDE_PERMS_MODE=research to use it.'

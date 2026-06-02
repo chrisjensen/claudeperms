@@ -603,22 +603,138 @@ describe('Empty defaults (seedDefaults: false)', () => {
 describe('Research mode', () => {
   const RESEARCH = { CLAUDE_PERMS_MODE: 'research' };
 
-  test('Bash denied even for trivially safe commands', async () => {
+  // --- Bash: read-only filesystem carve-outs ---
+
+  test('ls allowed in research mode', async () => {
     const r = await runHook({
-      input: { tool_name: 'Bash', tool_input: { command: 'ls' }, cwd: '/tmp' },
+      input: { tool_name: 'Bash', tool_input: { command: 'ls /tmp' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'allow');
+    assert.match(r.reason, /^\[research mode\] /);
+  });
+
+  test('find without -exec allowed in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'find . -name "*.ts" -type f' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'allow');
+  });
+
+  test('find with -exec denied in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'find . -exec curl {} \\;' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'deny');
+  });
+
+  test('grep allowed in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'grep -r "pattern" .' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'allow');
+  });
+
+  test('rg (ripgrep) allowed in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'rg "pattern" .' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'allow');
+  });
+
+  test('ls piped to grep allowed in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'ls | grep foo' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'allow');
+  });
+
+  test('head as root command allowed in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'head -20 README.md' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'allow');
+  });
+
+  test('find piped to head allowed in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'find . -name "*.ts" | head -20' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'allow');
+  });
+
+  test('ls piped to wc allowed in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'ls | wc -l' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'allow');
+  });
+
+  test('ls piped to bash denied in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'ls | bash' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'deny');
+  });
+
+  test('ls piped to custom script denied in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'ls | my-custom-script.js' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'deny');
+  });
+
+  test('find piped to xargs denied in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'find . -name "*.js" | xargs rm' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'deny');
+  });
+
+  test('command substitution in ls denied in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'ls $(rm -rf .)' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'deny');
+  });
+
+  test('redirect denied in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'grep foo . > /tmp/out.txt' }, cwd: '/tmp' },
+      env: RESEARCH,
+    });
+    assert.equal(r.decision, 'deny');
+  });
+
+  test('arbitrary Bash command denied in research mode', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'curl https://example.com' }, cwd: '/tmp' },
       env: RESEARCH,
     });
     assert.equal(r.decision, 'deny');
     assert.match(r.reason, /^\[research mode\] /);
-    assert.match(r.reason, /Execution-class/);
   });
 
-  test('Agent denied (sub-agents could escalate)', async () => {
+  test('Agent allowed (subagent tool calls still gated by this hook)', async () => {
+    // Asserts allow here; the Bash-in-research and MCP-in-research tests above
+    // confirm the inner deny gate still applies to anything the subagent calls.
     const r = await runHook({
       input: { tool_name: 'Agent', tool_input: { prompt: 'go research' }, cwd: '/tmp' },
       env: RESEARCH,
     });
-    assert.equal(r.decision, 'deny');
+    assert.equal(r.decision, 'allow');
     assert.match(r.reason, /^\[research mode\] /);
   });
 
