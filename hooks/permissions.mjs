@@ -397,8 +397,7 @@ function checkDeletion(command, cwd) {
 
 function denyDeletionMessage(trashLocation) {
   return (
-    `Deletion is not allowed. To remove files, use: \`mv <file> ${trashLocation}\` ` +
-      `(the ${trashLocation} directory will be created if needed)`
+    `Deletion is not allowed. To remove files, use: \`mkdir -p ${trashLocation} && mv <file> ${trashLocation}\``
   );
 }
 
