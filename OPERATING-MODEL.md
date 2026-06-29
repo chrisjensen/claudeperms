@@ -58,6 +58,35 @@ this (thousands of escalations, the classifier was not the relief valve).
 **Mode is near-irrelevant once `allowWrite` is set.** allowWrite is hard-allow and
 mode-independent. Pick mode for other reasons; it won't change the write outcome.
 
+## Auto mode hard-denies settings.json self-modification
+
+Editing `~/.claude/settings.json` (e.g. via the `/update-config` skill) does **not**
+work in auto mode. claude-perms correctly returns `ask` on the write, but auto mode
+never surfaces that as a prompt — it routes the `ask` to the server classifier, which
+**hard-denies** it:
+
+> Reason: Editing ~/.claude/settings.json is Self-Modification of agent startup
+> config, which cannot be cleared by user intent.
+
+`hard_deny` is not clearable by user intent, so `skipAutoPermissionPrompt` makes no
+difference — there is no prompt to show. Verified end-to-end:
+
+| Mode | `ask` path | Outcome on settings.json edit |
+|---|---|---|
+| `default` / `acceptEdits` | hook `ask` → **interactive prompt** | you approve → write succeeds |
+| `auto` | hook `ask` → classifier → **hard_deny** | denied, no prompt |
+
+(A benign non-config `.claude/*.md` write under auto mode is *allowed* by the
+classifier — only agent-startup-config self-modification is hard-denied.)
+
+### Operating guidance
+
+- **Config edits** (anything touching `settings.json` / agent startup config): use
+  the `/update-config` skill in **default** or **acceptEdits** mode (Shift+Tab). Auto
+  mode will hard-deny it.
+- **All other work**: stay in **auto** mode — the classifier finds a way to continue
+  for normal repo writes, and only escalates/denies the genuinely sensitive cases.
+
 ## Decisions to make
 
 1. **Worktree location — has a conflict, must resolve.** The native default is
