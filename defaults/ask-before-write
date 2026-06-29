@@ -31,3 +31,7 @@ CLAUDE.md
 # behavior-modifying files there.
 .claude/
 !~/.claude/plans/
+# Worktrees (native default <repo>/.claude/worktrees/) hold working copies of
+# repo code, not behavior-modifying config — exempt so subagent edits there
+# don't prompt on every write.
+!.claude/worktrees/
