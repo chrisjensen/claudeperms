@@ -86,6 +86,23 @@ async function runReviewer(systemPrompt, diff) {
     // The isolation contract that survives rests on the random per-invocation
     // nonce + exact-match output check, which is what the safety guarantee
     // actually relies on. See the NOT FOOLPROOF header for the broader caveats.
+    // Strip Claude-Code parent-session env vars so the reviewer subprocess
+    // doesn't inherit the parent's sandbox proxy (`ANTHROPIC_BASE_URL`
+    // pointing at 127.0.0.1:*) or session flags. Without this, running
+    // check-malicious from inside a Claude Code session routes the reviewer
+    // through the parent's proxy and stalls until the 120s SIGTERM.
+    const cleanEnv = { ...process.env };
+    for (const k of Object.keys(cleanEnv)) {
+      if (
+        k === 'ANTHROPIC_BASE_URL' ||
+        k === 'ANTHROPIC_CUSTOM_HEADERS' ||
+        k === 'CLAUDECODE' ||
+        k.startsWith('CLAUDE_CODE_')
+      ) {
+        delete cleanEnv[k];
+      }
+    }
+
     const child = spawn(claudeBin, [
       '--disable-slash-commands',
       '--setting-sources', '',
@@ -95,7 +112,7 @@ async function runReviewer(systemPrompt, diff) {
       '--permission-mode', 'dontAsk',
       '--system-prompt', systemPrompt,
       '-p',
-    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+    ], { stdio: ['pipe', 'pipe', 'pipe'], env: cleanEnv });
 
     let stdout = '';
     let stderr = '';
