@@ -51,6 +51,7 @@ async function runCheck(input, stubBehavior, extraEnv = {}) {
         ...process.env,
         CHECK_MALICIOUS_CLAUDE_BIN: stubPath,
         STUB_BEHAVIOR: stubBehavior,
+        CHECK_MALICIOUS_SKIP_PREFLIGHT: '1',
         ...extraEnv,
       },
       stdio: ['pipe', 'pipe', 'pipe'],

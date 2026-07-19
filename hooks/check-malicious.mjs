@@ -19,7 +19,7 @@
 // Usage:  git diff main...HEAD | check-malicious.mjs
 // Exit codes:  0 safe  1 concerns  2 empty input  3 reviewer invocation failed
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomBytes, createHash } from 'node:crypto';
 import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -144,6 +144,44 @@ async function runReviewer(systemPrompt, diff) {
   });
 }
 
+// Cheap reachability probe before the (slow) reviewer invocation. The reviewer
+// runs with ANTHROPIC_BASE_URL stripped (see runReviewer) but keeps HTTPS_PROXY,
+// so it reaches api.anthropic.com through the proxy. We probe with curl — not
+// node fetch — because curl honours HTTPS_PROXY the same way the reviewer's
+// `claude` binary does, whereas undici/fetch ignores proxy env and would connect
+// directly, giving a false "blocked" result. Probe the reviewer's real endpoint,
+// NOT the in-session ANTHROPIC_BASE_URL (which points at the parent proxy that
+// stalls). curl exit 0 => an HTTP response came back (any status, 401/404
+// included) => reachable. curl exit 28 => the connection was dropped (blackholed)
+// and timed out; anything else => refused/failed fast. Either non-zero => a
+// sandbox is almost certainly blocking outbound HTTPS, so abort instead of
+// hanging until the 120s reviewer SIGTERM.
+const PREFLIGHT_TIMEOUT_S = 10;
+
+function preflight() {
+  if (process.env.CHECK_MALICIOUS_SKIP_PREFLIGHT === '1') return; // hermetic tests / offline
+  const base = (process.env.CHECK_MALICIOUS_ANTHROPIC_BASE ?? 'https://api.anthropic.com').replace(/\/+$/, '');
+  const started = Date.now();
+  const res = spawnSync(
+    'curl',
+    ['-sS', '--max-time', String(PREFLIGHT_TIMEOUT_S), '-o', '/dev/null', '-w', '%{http_code}', base],
+    { encoding: 'utf8' },
+  );
+  if (res.status === 0) return;
+
+  const ms = Date.now() - started;
+  const detail = res.error ? res.error.message : ((res.stderr || '').trim() || `curl exit ${res.status}`);
+  const how = res.status === 28
+    ? `timed out after ${ms}ms (connection dropped)`
+    : `failed after ${ms}ms (${detail})`;
+  process.stderr.write(
+    `check-malicious: preflight to ${base} ${how}.\n` +
+    `An active sandbox is likely blocking outbound HTTPS to the Anthropic API.\n` +
+    `Re-run this command with the sandbox disabled (e.g. dangerouslyDisableSandbox), or allowlist api.anthropic.com.\n`
+  );
+  process.exit(3);
+}
+
 function writeLog(content) {
   const logDir = join(tmpdir(), 'claudeperms-checks');
   mkdirSync(logDir, { recursive: true });
@@ -225,6 +263,9 @@ async function main() {
   } else {
     process.stderr.write(`check-malicious: scanning ${total} batch(es)\n`);
   }
+
+  // Fail fast on a blocked network before spending time on the slow reviewer.
+  if (passed.size < total) preflight();
 
   for (let i = 0; i < batches.length; i++) {
     if (passed.has(i)) {
