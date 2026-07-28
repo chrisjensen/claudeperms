@@ -56,21 +56,123 @@ async function main() {
   try {
     input = JSON.parse(raw);
   } catch {
-    process.stdout.write(
-      JSON.stringify(ask('Hook error: failed to parse input JSON. Failing safe.')) + '\n'
-    );
-    process.exit(0);
+    emit(ask('Hook error: failed to parse input JSON. Failing safe.'), detectHarness(null));
+    return;
   }
 
+  const harness = detectHarness(input);
   let result;
   try {
-    result = dispatch(input);
+    result = dispatch(normalizeInput(input, harness));
   } catch (err) {
     result = ask(`Hook error: ${err.message}. Failing safe.`);
   }
 
-  process.stdout.write(JSON.stringify(result) + '\n');
-  process.exit(0);
+  emit(result, harness);
+}
+
+// Internal watchdog budget. Sits just under Kimi's hook timeout (default 30s)
+// so we self-terminate with a well-formed deny/ask BEFORE Kimi's fail-OPEN
+// fires — while leaving enough headroom below 30s to render and flush. Set high
+// (not aggressively low) on purpose: compute is sub-second, so the only thing
+// this catches is a stuck stdin, and a tight budget would risk a false deny on
+// a merely-slow payload. 25s = 5s margin under Kimi's 30s. Well under Claude
+// Code's 60s default too (and Claude fails safe regardless).
+const WATCHDOG_MS = Number(process.env.CLAUDE_PERMS_WATCHDOG_MS) || 25000;
+
+// Guards against a double-emit when the watchdog or a crash handler races the
+// normal path. First writer wins; process.exit() below makes it terminal.
+let settled = false;
+
+function emit(result, harness) {
+  if (settled) return;
+  settled = true;
+  const { stdout, stderr, exitCode } = render(result, harness);
+  if (stdout) process.stdout.write(stdout);
+  if (stderr) process.stderr.write(stderr);
+  process.exit(exitCode);
+}
+
+// Fail safe on any crash/timeout: emit a well-formed decision instead of
+// letting Node exit non-zero (which Kimi treats as ALLOW) or hang (Kimi
+// fail-open at timeout). Uses ask(): the adapter renders this as a hard deny
+// under Kimi and an interactive prompt under Claude Code — both fail-safe.
+function failSafe(reason) {
+  emit(ask(`Hook error: ${reason}. Failing safe.`), detectHarness(null));
+}
+
+// === Harness adapters =================================================
+//
+// The decision core (dispatch + all check* functions) speaks Claude Code's
+// vocabulary: tool_name in {Bash, WebFetch, Read, Write, Edit, Glob, Grep} and
+// a three-way decision {allow, ask, deny} encoded in stdout with exit 0.
+//
+// Kimi Code CLI (kimicode) differs on both ends:
+//   - Input tool names: Shell, ReadFile/ReadMediaFile, WriteFile,
+//     StrReplaceFile, FetchURL, SearchWeb (tool_input field names — command,
+//     file_path, url — already match Claude's).
+//   - Output: a PreToolUse hook can only allow (exit 0) or block; there is no
+//     interactive `ask`. A structured deny is `hookSpecificOutput
+//     .permissionDecision:"deny"` on exit 0, with the reason fed to the model.
+//
+// We therefore select an adapter at runtime, remap the input tool name to the
+// internal vocabulary, run the unchanged core, then render the decision in the
+// target harness's dialect. Per project decision, kimi collapses `ask` -> deny
+// (fail-safe) since it cannot prompt.
+
+const HARNESS = { claude: 'claude', kimi: 'kimi' };
+
+const KIMI_TOOL_NAMES = new Map([
+  ['Shell', 'Bash'],
+  ['ReadFile', 'Read'],
+  ['ReadMediaFile', 'Read'],
+  ['WriteFile', 'Write'],
+  ['StrReplaceFile', 'Edit'],
+  ['FetchURL', 'WebFetch'],
+]);
+
+function detectHarness(input) {
+  const env = process.env.CLAUDE_PERMS_HARNESS;
+  if (env === 'kimi' || env === 'kimicode') return HARNESS.kimi;
+  if (env === 'claude' || env === 'claude-code') return HARNESS.claude;
+  if (input && typeof input === 'object') {
+    if ('transcript_path' in input) return HARNESS.claude;
+    if ('tool_call_id' in input) return HARNESS.kimi;
+  }
+  return HARNESS.claude;
+}
+
+function normalizeInput(input, harness) {
+  if (harness !== HARNESS.kimi) return input;
+  const mapped = KIMI_TOOL_NAMES.get(input?.tool_name);
+  if (!mapped) return input; // unknown kimi tool -> dispatch's allow() default
+  return { ...input, tool_name: mapped };
+}
+
+function render(result, harness) {
+  const out = result.hookSpecificOutput ?? {};
+  const dec = out.permissionDecision;
+  const reason = out.permissionDecisionReason ?? '';
+
+  if (harness !== HARNESS.kimi) {
+    // Claude Code: decision lives entirely in stdout JSON; always exit 0.
+    return { stdout: JSON.stringify(result) + '\n', stderr: '', exitCode: 0 };
+  }
+
+  if (dec === 'allow') {
+    return { stdout: '', stderr: '', exitCode: 0 };
+  }
+  const kimiReason = dec === 'ask'
+    ? `[approval required] ${reason} — this harness cannot prompt interactively; blocking. Ask the user, then retry.`
+    : reason;
+  const body = {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: kimiReason,
+    },
+  };
+  return { stdout: JSON.stringify(body) + '\n', stderr: '', exitCode: 0 };
 }
 
 function dispatch(input) {
@@ -1016,4 +1118,13 @@ function isSandboxEnabled() {
 
 // === Entry point ======================================================
 
-main();
+// Watchdog: if nothing has been emitted within the budget (e.g. stdin never
+// closes), fail safe. unref() so the timer never keeps the process alive on the
+// normal fast path.
+const watchdog = setTimeout(() => failSafe('watchdog timeout'), WATCHDOG_MS);
+watchdog.unref();
+
+process.on('uncaughtException', (err) => failSafe(err?.message ?? String(err)));
+process.on('unhandledRejection', (err) => failSafe(err?.message ?? String(err)));
+
+main().catch((err) => failSafe(err?.message ?? String(err)));

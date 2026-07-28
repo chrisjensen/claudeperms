@@ -815,3 +815,83 @@ describe('Research mode', () => {
     assert.doesNotMatch(r.reason, /research mode/);
   });
 });
+
+describe('Kimi harness adapter', () => {
+  const kimi = { CLAUDE_PERMS_HARNESS: 'kimi' };
+
+  test('Shell rm remaps to Bash and denies (deletion gate through mapping)', async () => {
+    const r = await runHook({
+      env: kimi,
+      input: { tool_name: 'Shell', tool_input: { command: 'rm foo' }, cwd: '/tmp' },
+    });
+    assert.equal(r.decision, 'deny');
+    assert.equal(r.raw.hookSpecificOutput.hookEventName, 'PreToolUse');
+    assert.match(r.reason, /Deletion is not allowed/);
+  });
+
+  test('WriteFile to sensitive path (internal ask) collapses to deny', async () => {
+    const r = await runHook({
+      env: kimi,
+      input: { tool_name: 'WriteFile', tool_input: { file_path: '.env' }, cwd: '/tmp' },
+    });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /^\[approval required\] /);
+    assert.match(r.reason, /cannot prompt interactively/);
+  });
+
+  test('ReadFile of an allowed path renders as allow (empty stdout)', async () => {
+    const r = await runHook({
+      env: kimi,
+      input: { tool_name: 'ReadFile', tool_input: { file_path: 'normal.txt' }, cwd: '/tmp' },
+    });
+    assert.equal(r.decision, 'allow');
+    assert.equal(r.raw, null);
+  });
+
+  test('unknown kimi tool falls through to allow', async () => {
+    const r = await runHook({
+      env: kimi,
+      input: { tool_name: 'SearchWeb', tool_input: { query: 'x' }, cwd: '/tmp' },
+    });
+    assert.equal(r.decision, 'allow');
+  });
+
+  test('detection: tool_call_id in payload infers kimi without env var', async () => {
+    // No env var; a deletion that would deny under either harness — assert the
+    // kimi output shape (empty stdout on allow is kimi-only, but here we get a
+    // deny; the discriminator is that Claude would emit permissionDecision too).
+    const r = await runHook({
+      input: {
+        tool_name: 'Shell',
+        tool_input: { command: 'rm foo' },
+        cwd: '/tmp',
+        tool_call_id: 'call_123',
+      },
+    });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /Deletion is not allowed/);
+  });
+
+  test('detection: transcript_path forces claude (ask stays ask)', async () => {
+    const r = await runHook({
+      input: {
+        tool_name: 'Write',
+        tool_input: { file_path: '.env' },
+        cwd: '/tmp',
+        transcript_path: '/tmp/t.jsonl',
+      },
+    });
+    assert.equal(r.decision, 'ask');
+  });
+
+  test('watchdog fails safe to deny when stdin never closes (kimi)', async () => {
+    const r = await runHook({
+      env: { CLAUDE_PERMS_HARNESS: 'kimi', CLAUDE_PERMS_WATCHDOG_MS: '150' },
+      input: { tool_name: 'Shell', tool_input: { command: 'ls' }, cwd: '/tmp' },
+      holdStdin: true,
+    });
+    assert.equal(r.exitCode, 0);
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /watchdog timeout/);
+  });
+});

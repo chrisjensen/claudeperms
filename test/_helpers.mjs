@@ -33,8 +33,11 @@ const DEFAULTS_DIR = join(REPO_ROOT, 'defaults');
 //                 (CLAUDE_PERMS_MODE is stripped from the default env so a host
 //                 shell that sets it can't leak into default-mode tests).
 //
-// Returns { decision, reason, raw, home }.
-export async function runHook({ input, rawInput, files = {}, seedDefaults = true, env = {} } = {}) {
+// Returns { decision, reason, raw, home, exitCode }. Under kimi the hook emits
+// empty stdout on allow, so decision is 'allow' with no raw payload.
+//   holdStdin      if true, write the payload but never close stdin — used to
+//                 exercise the watchdog (harness opens stdin but never EOFs).
+export async function runHook({ input, rawInput, files = {}, seedDefaults = true, env = {}, holdStdin = false } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'claude-perms-test-'));
   try {
     const claudePermsDir = join(home, '.claudeperms');
@@ -70,7 +73,11 @@ export async function runHook({ input, rawInput, files = {}, seedDefaults = true
     child.stderr.on('data', (c) => stderrChunks.push(c));
 
     const payload = rawInput ?? JSON.stringify(input);
-    child.stdin.end(payload);
+    if (holdStdin) {
+      child.stdin.write(payload); // never end() — watchdog must fire
+    } else {
+      child.stdin.end(payload);
+    }
 
     const exitCode = await new Promise((resolveExit, rejectExit) => {
       child.on('error', rejectExit);
@@ -86,6 +93,11 @@ export async function runHook({ input, rawInput, files = {}, seedDefaults = true
       );
     }
 
+    // Kimi renders `allow` as empty stdout with exit 0; treat that as allow.
+    if (stdout.trim() === '') {
+      return { decision: 'allow', reason: undefined, raw: null, home, exitCode };
+    }
+
     let parsed;
     try {
       parsed = JSON.parse(stdout);
@@ -99,6 +111,7 @@ export async function runHook({ input, rawInput, files = {}, seedDefaults = true
       reason: hookOut.permissionDecisionReason,
       raw: parsed,
       home,
+      exitCode,
     };
   } finally {
     rmSync(home, { recursive: true, force: true });

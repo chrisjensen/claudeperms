@@ -65,6 +65,31 @@ Unknown tools are not gated. Regex safety gates (`rm`, truncation, `dd`, `/proc`
    # expect: "permissionDecision":"deny"
    ```
 
+## Kimi Code CLI (kimicode)
+
+The same hook runs under [Kimi Code CLI](https://github.com/MoonshotAI/kimi-cli). One codebase serves both harnesses: at runtime the hook selects an adapter that remaps Kimi's tool names to the internal vocabulary and renders the decision in Kimi's dialect. The decision core (all `check*` logic, research mode) is shared and unchanged.
+
+### Install for Kimi
+
+`npm run setup` auto-wires Kimi when `~/.kimi/` exists. It appends a `PreToolUse` hook to `~/.kimi/config.toml` (idempotent — skipped if already present, never clobbers your config):
+
+```toml
+[[hooks]]
+event = "PreToolUse"
+matcher = ""
+command = "CLAUDE_PERMS_HARNESS=kimi node ~/.claudeperms/permissions.mjs"
+timeout = 30
+```
+
+The `CLAUDE_PERMS_HARNESS=kimi` env var is authoritative for adapter selection. If unset, the hook infers the harness from the input payload (`transcript_path` ⇒ Claude Code, `tool_call_id` ⇒ Kimi), defaulting to Claude Code.
+
+### Behavior differences vs Claude Code
+
+- **Tool-name remap** (input `tool_input` field names already match): `Shell`→`Bash`, `ReadFile`/`ReadMediaFile`→`Read`, `WriteFile`→`Write`, `StrReplaceFile`→`Edit`, `FetchURL`→`WebFetch`. Unknown Kimi tools (e.g. `SearchWeb`, `Agent`) are not gated.
+- **No interactive `ask`.** A Kimi `PreToolUse` hook can only allow or block — it cannot trigger an approval prompt. Every internal `ask` therefore **collapses to `deny`** (fail-safe), with the reason prefixed `[approval required]` telling the model to get explicit user approval and retry. This is stricter than under Claude Code, where the same case would prompt.
+- **Output encoding.** `allow` → empty stdout, exit 0. `deny` → `hookSpecificOutput.permissionDecision:"deny"` on exit 0, reason fed to the model.
+- **Kimi is fail-OPEN.** On hook crash or timeout (30s), Kimi allows the call — the opposite of this project's fail-safe stance. This is Kimi's design and cannot be overridden from the hook, so keep the hook fast.
+
 ## Research mode
 
 A second posture for sessions where the assistant should crawl widely (web research, source review) but never execute. Off by default; activated by an environment variable inherited from the launching shell. Mitigates prompt-injection from fetched pages by hard-denying every execution-class tool — a hook `deny` overrides any `settings.json` `allow` rule, including `bypassPermissions`.

@@ -48,6 +48,21 @@ hook-logic job.
 | `worktree.symlinkDirectories` | Symlinks deps into worktrees so agents don't write outside the sandbox. Needs the **subdir** path (e.g. `api/node_modules`), not repo root. | settings |
 | Network (`--unshare-net`) | Host localhost (e.g. DB on 5432) is unreachable from sandboxed bash. Route DB work through a command head that's allowed, or accept the escalation. | sandbox |
 
+## Two-harness adapter model (Claude Code + Kimi Code CLI)
+
+The hook runs under both Claude Code and Kimi Code CLI (`kimicode`) from one
+codebase. `detectHarness()` picks an adapter (`CLAUDE_PERMS_HARNESS` env var
+first, else input-shape inference); `normalizeInput()` remaps Kimi tool names to
+the internal vocabulary; `render()` emits the decision in the target dialect. The
+four gates and all `check*` logic are shared and unaware of the harness.
+
+Key semantic gap: **Kimi has no interactive `ask`.** A Kimi `PreToolUse` hook can
+only allow or block. So under Kimi the three-way decision collapses to two —
+every internal `ask` becomes a `deny` (fail-safe). Under Claude Code the same
+case prompts. Kimi is also fail-*open* on hook error/timeout (Claude Code is
+fail-safe → ask); that is Kimi's design and not overridable from the hook. See
+README "Kimi Code CLI" for the tool-name map and install wiring.
+
 ## Why auto mode does not fix the flood
 
 The dominant toil = `dangerouslyDisableSandbox` escalations (writes to sibling
