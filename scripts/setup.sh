@@ -30,25 +30,38 @@ done
 # Rename claudeperms-package.json → package.json on first install only.
 [ -e "$DEST/package.json" ] || cp defaults/claudeperms-package.json "$DEST/package.json"
 
-# Kimi Code CLI wiring: if ~/.kimi exists, register a PreToolUse hook in
-# config.toml pointing at the same permissions.mjs, tagged so the hook selects
-# its kimi adapter. TOML has no easy CLI merge, so append the block only when an
-# equivalent one is absent (idempotent). Never create ~/.kimi or clobber config.
+# Kimi Code CLI wiring: if ~/.kimi exists, register PreToolUse hooks in
+# config.toml. permissions.mjs is tagged CLAUDE_PERMS_HARNESS=kimi so it selects
+# its kimi adapter; the two suggest scripts run under both harnesses and match
+# kimi's Shell tool (Claude's Bash). TOML has no easy CLI merge, so each block is
+# appended only when absent (idempotent). Never create ~/.kimi or clobber config.
 KIMI_DIR="$HOME/.kimi"
 KIMI_CONFIG="$KIMI_DIR/config.toml"
-if [ -d "$KIMI_DIR" ]; then
-  if [ -f "$KIMI_CONFIG" ] && grep -q "claudeperms/permissions.mjs" "$KIMI_CONFIG"; then
-    echo "kimi: permissions hook already present in $KIMI_CONFIG — leaving as-is."
-  else
-    {
-      printf '\n[[hooks]]\n'
-      printf 'event = "PreToolUse"\n'
-      printf 'matcher = ""\n'
-      printf 'command = "CLAUDE_PERMS_HARNESS=kimi node %s/permissions.mjs"\n' "$DEST"
-      printf 'timeout = 30\n'
-    } >> "$KIMI_CONFIG"
-    echo "kimi: registered permissions hook in $KIMI_CONFIG."
+
+# append_kimi_hook <grep-key> <matcher> <command>
+append_kimi_hook() {
+  if [ -f "$KIMI_CONFIG" ] && grep -qF "$1" "$KIMI_CONFIG"; then
+    echo "kimi: hook '$1' already present in $KIMI_CONFIG — leaving as-is."
+    return
   fi
+  {
+    printf '\n[[hooks]]\n'
+    printf 'event = "PreToolUse"\n'
+    printf 'matcher = "%s"\n' "$2"
+    printf 'command = "%s"\n' "$3"
+    printf 'timeout = 30\n'
+  } >> "$KIMI_CONFIG"
+  echo "kimi: registered hook '$1' in $KIMI_CONFIG."
+}
+
+if [ -d "$KIMI_DIR" ]; then
+  HOOKS_DIR="$HOME/.claude/hooks"
+  append_kimi_hook "claudeperms/permissions.mjs" "" \
+    "CLAUDE_PERMS_HARNESS=kimi node $DEST/permissions.mjs"
+  append_kimi_hook "long-command-suggest.sh" "Shell" \
+    "CLAUDE_PERMS_HARNESS=kimi bash $HOOKS_DIR/long-command-suggest.sh"
+  append_kimi_hook "source-commit-enforce.sh" "Shell" \
+    "CLAUDE_PERMS_HARNESS=kimi bash $HOOKS_DIR/source-commit-enforce.sh"
 else
   echo "kimi: ~/.kimi not found — skipping Kimi Code CLI wiring."
 fi
