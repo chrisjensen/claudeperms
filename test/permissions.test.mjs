@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runHook } from './_helpers.mjs';
@@ -893,5 +893,71 @@ describe('Kimi harness adapter', () => {
     assert.equal(r.exitCode, 0);
     assert.equal(r.decision, 'deny');
     assert.match(r.reason, /watchdog timeout/);
+  });
+});
+
+describe('rtk-rewrite carve-out', () => {
+  // Stub rtk: reads the hook JSON, echoes rtk's updatedInput shape wrapping the
+  // command with `rtk `. Lets us assert attach behaviour without the real binary.
+  function makeRtkStub() {
+    const dir = mkdtempSync(join(tmpdir(), 'rtk-stub-'));
+    const bin = join(dir, 'rtk');
+    writeFileSync(
+      bin,
+      `#!/usr/bin/env node
+let s = '';
+process.stdin.on('data', (c) => (s += c));
+process.stdin.on('end', () => {
+  const cmd = JSON.parse(s).tool_input.command;
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput: { command: 'rtk ' + cmd } },
+  }));
+});
+`
+    );
+    chmodSync(bin, 0o755);
+    return bin;
+  }
+
+  const enabled = { 'config.json': '{"rtkRewrite":{"enabled":true}}' };
+
+  test('allowed Bash command gets rtk-wrapped updatedInput', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'gh pr view 130' }, cwd: '/tmp' },
+      files: enabled,
+      env: { CLAUDE_PERMS_RTK_BIN: makeRtkStub() },
+    });
+    assert.equal(r.decision, 'allow');
+    assert.equal(r.raw.hookSpecificOutput.updatedInput.command, 'rtk gh pr view 130');
+  });
+
+  test('already rtk-wrapped command is not double-wrapped', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'rtk gh pr view 130' }, cwd: '/tmp' },
+      files: enabled,
+      env: { CLAUDE_PERMS_RTK_BIN: makeRtkStub() },
+    });
+    assert.equal(r.decision, 'allow');
+    assert.equal(r.raw.hookSpecificOutput.updatedInput, undefined);
+  });
+
+  test('disabled config attaches no rewrite', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'gh pr view 130' }, cwd: '/tmp' },
+      files: { 'config.json': '{"rtkRewrite":{"enabled":false}}' },
+      env: { CLAUDE_PERMS_RTK_BIN: makeRtkStub() },
+    });
+    assert.equal(r.decision, 'allow');
+    assert.equal(r.raw.hookSpecificOutput.updatedInput, undefined);
+  });
+
+  test('missing rtk binary degrades to plain allow', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'gh pr view 130' }, cwd: '/tmp' },
+      files: enabled,
+      env: { CLAUDE_PERMS_RTK_BIN: '/nonexistent/rtk' },
+    });
+    assert.equal(r.decision, 'allow');
+    assert.equal(r.raw.hookSpecificOutput.updatedInput, undefined);
   });
 });

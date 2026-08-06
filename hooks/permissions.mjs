@@ -22,6 +22,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { join, resolve } from 'path';
 import { homedir, tmpdir } from 'os';
+import { execFileSync } from 'child_process';
 
 // === Constants ========================================================
 //
@@ -63,7 +64,9 @@ async function main() {
   const harness = detectHarness(input);
   let result;
   try {
-    result = dispatch(normalizeInput(input, harness));
+    const normalized = normalizeInput(input, harness);
+    result = dispatch(normalized);
+    result = maybeAttachRtkRewrite(result, normalized, harness);
   } catch (err) {
     result = ask(`Hook error: ${err.message}. Failing safe.`);
   }
@@ -705,6 +708,68 @@ function stripRtkWrapper(s) {
   let rest = s.slice(4).trim();
   if (rest.startsWith('proxy ')) rest = rest.slice(6).trim();
   return rest;
+}
+
+// rtk-rewrite carve-out: when enabled, this hook subsumes the separate
+// `rtk hook claude` PreToolUse hook. That hook rewrites bash commands to their
+// rtk-proxied form via `updatedInput` but emits no permissionDecision, so a
+// prior `allow` from this hook is computed against the ORIGINAL command and
+// does not survive the rewrite — Claude Code re-checks its allowlist against the
+// rewritten command and prompts. By computing the same rewrite HERE and emitting
+// it alongside our `allow` in one hookSpecificOutput, the approval and the
+// rewrite come from the same decision, so the rewritten command is auto-approved.
+// The rewrite itself is delegated to `rtk hook claude` (authoritative — it knows
+// which commands to wrap and which to skip, e.g. `cd`), never reimplemented.
+function loadRtkRewriteEnabled() {
+  const path = join(homedir(), '.claudeperms', 'config.json');
+  if (!existsSync(path)) return false;
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    return parsed.rtkRewrite?.enabled === true;
+  } catch {
+    return false;
+  }
+}
+
+// Ask rtk what it would rewrite this command to. Returns the rewritten command
+// string, or null on any failure (rtk missing, timeout, no rewrite, bad output)
+// so the caller degrades to emitting the decision without a rewrite.
+function computeRtkRewrite(input) {
+  const rtkBin = process.env.CLAUDE_PERMS_RTK_BIN || 'rtk';
+  try {
+    const out = execFileSync(rtkBin, ['hook', 'claude'], {
+      input: JSON.stringify(input),
+      encoding: 'utf8',
+      timeout: 4000,
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    if (!out || !out.trim()) return null;
+    const cmd = JSON.parse(out)?.hookSpecificOutput?.updatedInput?.command;
+    return typeof cmd === 'string' && cmd.length > 0 ? cmd : null;
+  } catch {
+    return null;
+  }
+}
+
+// Attach rtk's command rewrite to an already-decided result. Only fires for a
+// claude-harness Bash command we're allowing, when the feature is enabled and the
+// command is not already rtk-wrapped. Preserves the existing decision verbatim and
+// adds updatedInput carrying the rewritten command (other tool_input fields kept).
+function maybeAttachRtkRewrite(result, input, harness) {
+  if (harness !== HARNESS.claude) return result;
+  if (input?.tool_name !== 'Bash') return result;
+  if (result?.hookSpecificOutput?.permissionDecision !== 'allow') return result;
+  if (!loadRtkRewriteEnabled()) return result;
+  const command = input?.tool_input?.command ?? '';
+  if (!command || command.startsWith('rtk ')) return result;
+  const rewritten = computeRtkRewrite(input);
+  if (!rewritten || rewritten === command) return result;
+  return {
+    hookSpecificOutput: {
+      ...result.hookSpecificOutput,
+      updatedInput: { ...input.tool_input, command: rewritten },
+    },
+  };
 }
 
 // `gh api` defaults to GET but can mutate via:
