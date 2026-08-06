@@ -144,29 +144,66 @@ async function runReviewer(systemPrompt, diff) {
   });
 }
 
-// Cheap reachability probe before the (slow) reviewer invocation. The reviewer
-// runs with ANTHROPIC_BASE_URL stripped (see runReviewer) but keeps HTTPS_PROXY,
-// so it reaches api.anthropic.com through the proxy. We probe with curl — not
-// node fetch — because curl honours HTTPS_PROXY the same way the reviewer's
-// `claude` binary does, whereas undici/fetch ignores proxy env and would connect
-// directly, giving a false "blocked" result. Probe the reviewer's real endpoint,
-// NOT the in-session ANTHROPIC_BASE_URL (which points at the parent proxy that
-// stalls). curl exit 0 => an HTTP response came back (any status, 401/404
-// included) => reachable. curl exit 28 => the connection was dropped (blackholed)
-// and timed out; anything else => refused/failed fast. Either non-zero => a
-// sandbox is almost certainly blocking outbound HTTPS, so abort instead of
-// hanging until the 120s reviewer SIGTERM.
+// Resolve the base URL the reviewer's `claude` will ACTUALLY connect to, so the
+// preflight probes that exact endpoint. The launcher may be a wrapper script
+// (e.g. ~/.claude-wrap/claude) that hardcodes `ANTHROPIC_BASE_URL=<local proxy>`
+// via `exec env VAR=... realclaude`. runReviewer strips ANTHROPIC_BASE_URL from
+// the child env, but a wrapper's hardcoded `env VAR=` re-injects it and wins —
+// so the reviewer hits the wrapper's URL, not api.anthropic.com. If we probed
+// api.anthropic.com we'd get a false PASS while the reviewer stalls on an
+// unreachable local proxy until the 120s SIGTERM. Resolution order:
+//   1. CHECK_MALICIOUS_ANTHROPIC_BASE  — explicit override (tests).
+//   2. If `claude` resolves to a shell script that assigns ANTHROPIC_BASE_URL,
+//      use that literal — it's what the wrapper forces onto the reviewer.
+//   3. Else the reviewer's env-resolved base: ANTHROPIC_BASE_URL, or the default.
+function resolveReviewerBase() {
+  if (process.env.CHECK_MALICIOUS_ANTHROPIC_BASE) return process.env.CHECK_MALICIOUS_ANTHROPIC_BASE;
+
+  const claudeBin = process.env.CHECK_MALICIOUS_CLAUDE_BIN ?? 'claude';
+  const which = spawnSync('sh', ['-c', `command -v -- "$1"`, 'sh', claudeBin], { encoding: 'utf8' });
+  const binPath = (which.stdout || '').trim();
+
+  if (binPath) {
+    try {
+      const buf = readFileSync(binPath);
+      const isBinary = buf.subarray(0, 1024).includes(0x00); // NUL byte => real binary, not a script
+      if (!isBinary) {
+        // Last assignment wins, matching shell evaluation order.
+        const matches = [...buf.toString('utf8').matchAll(/ANTHROPIC_BASE_URL=(["']?)([^"'\s]+)\1/g)];
+        const last = matches.at(-1);
+        if (last) return last[2];
+      }
+    } catch {
+      // not readable / not a regular file — fall through to env default
+    }
+  }
+
+  return process.env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com';
+}
+
+// Cheap reachability probe before the (slow) reviewer invocation, aimed at the
+// endpoint the reviewer truly hits (see resolveReviewerBase). We probe with curl
+// — not node fetch — because curl honours HTTPS_PROXY the same way claude's HTTP
+// client does for remote hosts, whereas undici/fetch ignores proxy env. Loopback
+// targets (a local proxy like the wrapper's) are probed with --noproxy so we test
+// the same direct connection the reviewer makes. curl exit 0 => an HTTP response
+// came back (any status, 401/404 included) => reachable. curl exit 28 => the
+// connection was dropped (blackholed) and timed out; anything else =>
+// refused/failed fast. Either non-zero => the endpoint is unreachable (sandbox
+// block or the local proxy is down), so abort instead of hanging until the 120s
+// reviewer SIGTERM.
 const PREFLIGHT_TIMEOUT_S = 10;
 
 function preflight() {
   if (process.env.CHECK_MALICIOUS_SKIP_PREFLIGHT === '1') return; // hermetic tests / offline
-  const base = (process.env.CHECK_MALICIOUS_ANTHROPIC_BASE ?? 'https://api.anthropic.com').replace(/\/+$/, '');
+  const base = resolveReviewerBase().replace(/\/+$/, '');
+  const isLoopback = /^https?:\/\/(127(\.\d+){3}|localhost|\[::1\]|0\.0\.0\.0)(:|\/|$)/i.test(base);
+  const args = ['-sS', '--max-time', String(PREFLIGHT_TIMEOUT_S)];
+  if (isLoopback) args.push('--noproxy', '*');
+  args.push('-o', '/dev/null', '-w', '%{http_code}', base);
+
   const started = Date.now();
-  const res = spawnSync(
-    'curl',
-    ['-sS', '--max-time', String(PREFLIGHT_TIMEOUT_S), '-o', '/dev/null', '-w', '%{http_code}', base],
-    { encoding: 'utf8' },
-  );
+  const res = spawnSync('curl', args, { encoding: 'utf8' });
   if (res.status === 0) return;
 
   const ms = Date.now() - started;
@@ -175,9 +212,9 @@ function preflight() {
     ? `timed out after ${ms}ms (connection dropped)`
     : `failed after ${ms}ms (${detail})`;
   process.stderr.write(
-    `check-malicious: preflight to ${base} ${how}.\n` +
-    `An active sandbox is likely blocking outbound HTTPS to the Anthropic API.\n` +
-    `Re-run this command with the sandbox disabled (e.g. dangerouslyDisableSandbox), or allowlist api.anthropic.com.\n`
+    `check-malicious: preflight to reviewer endpoint ${base} ${how}.\n` +
+    `That endpoint is unreachable — a sandbox is likely blocking it, or the local proxy it points at is down.\n` +
+    `Re-run with the sandbox disabled (e.g. dangerouslyDisableSandbox), start the proxy, or allowlist ${base}.\n`
   );
   process.exit(3);
 }
