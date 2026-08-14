@@ -46,6 +46,14 @@ const DD_PATTERNS = [/\bdd\b/];
 const RAW_DISK_PATTERNS = [/\/dev\/(?:sd|hd|nvme|disk)/];
 const PROC_PATTERNS = [/\/proc\//];
 
+// A direct prettier invocation (start of a command segment, or via
+// npx/pnpm/yarn/node_modules bin). Matched so we can force it through
+// `rtk proxy` — see checkBashCommand step 2b for the rtk #2878 rationale.
+const PRETTIER_INVOKE_RE =
+  /(?:^|[;&|]|\bnpx\s+|\bpnpm\s+(?:exec\s+|dlx\s+)?|\byarn\s+(?:exec\s+)?|node_modules\/\.bin\/)\s*prettier\b/;
+// Anything already wrapped in `rtk proxy` bypasses rtk's output filter, so it is safe.
+const RTK_PROXY_RE = /\brtk\s+proxy\b/;
+
 // === main() and tool dispatcher =======================================
 
 async function main() {
@@ -365,6 +373,21 @@ function checkBashCommand(command, cwd, opts = {}) {
   // 2. Truncation redirects — deny only if target file exists
   const truncResult = checkTruncationRedirects(command, cwd);
   if (truncResult) return truncResult;
+
+  // 2b. Direct prettier invocations are rewritten by the rtk Claude Code hook
+  // into rtk's filtered prettier. On rtk 0.42 (bug rtk-ai/rtk#2878, still OPEN)
+  // that filter drops prettier 3's `[warn]` lines and prints a canned
+  // "All files formatted correctly" while the real exit code is 1 — a false
+  // pass that hides formatting failures. Force the proxy, which bypasses the
+  // filter so `[warn]` and the exit code both surface.
+  if (PRETTIER_INVOKE_RE.test(command) && !RTK_PROXY_RE.test(command)) {
+    return deny(
+      'Bare prettier runs are rewritten by rtk and its output filter hides prettier 3 ' +
+        'failures (false "All files formatted correctly" on exit 1 — rtk-ai/rtk#2878). ' +
+        'Run it through the proxy instead, e.g. `rtk proxy npx prettier --check "**/*.{ts,tsx,js,json,md}"`, ' +
+        'and judge pass/fail by the exit code.'
+    );
+  }
 
   // 3. Sensitive file references (read/write split based on inferred intent)
   const sensitiveHit = commandTouchesSensitive(command, cwd);
