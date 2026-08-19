@@ -3,7 +3,5 @@
     "enabled": true,
     "location": ".trash/"
   },
-  "rtkRewrite": {
-    "enabled": false
-  }
+  "chainedHooks": []
 }

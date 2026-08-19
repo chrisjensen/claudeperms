@@ -1,0 +1,5 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "anthropic/hf:moonshotai/Kimi-K3",
+  "small_model": "anthropic/glm-4.6"
+}

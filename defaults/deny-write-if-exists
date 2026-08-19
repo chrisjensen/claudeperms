@@ -1,0 +1,15 @@
+# Patterns that HARD-DENY a write when the target file already exists.
+# Applies to Write/Edit tools and to inferred Bash write targets (redirects,
+# tee, sed -i, mv/cp dest). Creating an absent file still falls through to the
+# ask-before-write prompt — this list only blocks overwrite/replace of an
+# existing file. Escape hatch: run the command yourself with the `!` shell
+# prefix, which bypasses the hook entirely.
+#
+# Same pattern shapes and !pattern negation as ask-before-write.
+
+# Protect ONLY the literal .env — dev .env must never be clobbered by copying
+# TEST.env / .env.CI over it. A bare basename ".env" also matches ".env.local",
+# ".env.CI" etc. (basename.startsWith(".env.")), so negate the dotted variants:
+# those are safe to (re)write.
+.env
+!.env.*

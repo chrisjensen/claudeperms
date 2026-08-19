@@ -18,7 +18,13 @@ hook-logic job.
    drops this auto-allow and falls back to plain permission rules.
 2. **Permission rules + mode** — allow/deny/ask rules, filtered by the active mode.
    Auto mode strips "dangerous" allow rules (see below).
-3. **PreToolUse hook = claude-perms** — returns allow / ask / deny.
+3. **PreToolUse hook = claude-perms** — returns allow / ask / deny. It is the
+   **single** registered PreToolUse hook: it runs any other configured hooks
+   (`chainedHooks` in `config.json`) as an **ordered pipeline** — command
+   rewriters (e.g. rtk) first, threading their rewrite forward; gates
+   contributing verdicts — then its **own** check **last, on the rewritten
+   command**, and emits one deterministic verdict (`deny > ask > allow`). This
+   keeps the harness looking at one hook instead of several racing ones.
 4. **Auto-mode server classifier** — only in auto mode; judges escalations.
    **Cannot approve `dangerouslyDisableSandbox`** (non-classifier-approvable).
 

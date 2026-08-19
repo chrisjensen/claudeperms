@@ -65,8 +65,17 @@ async function main() {
   let result;
   try {
     const normalized = normalizeInput(input, harness);
-    result = dispatch(normalized);
-    result = maybeAttachRtkRewrite(result, normalized, harness);
+    // Run configured chained PreToolUse hooks (rewriters + gates) FIRST, in
+    // order, then our own check LAST on the accumulated rewrite. See the
+    // chained-hook pipeline section below.
+    const { working, gateVerdict, gateReason } = runChainedPipeline(normalized);
+    if (gateVerdict === 'deny') {
+      result = deny(gateReason); // a chained gate blocked; skip our own check
+    } else {
+      const own = dispatch(working); // OWN CHECK LAST, on the rewritten command
+      result = mergeVerdicts(own, gateVerdict, gateReason); // deny > ask > allow
+      result = maybeAttachUpdatedInput(result, normalized, working, harness);
+    }
   } catch (err) {
     result = ask(`Hook error: ${err.message}. Failing safe.`);
   }
@@ -123,7 +132,7 @@ function failSafe(reason) {
 // target harness's dialect. Per project decision, kimi collapses `ask` -> deny
 // (fail-safe) since it cannot prompt.
 
-const HARNESS = { claude: 'claude', kimi: 'kimi' };
+const HARNESS = { claude: 'claude', kimi: 'kimi', opencode: 'opencode' };
 
 const KIMI_TOOL_NAMES = new Map([
   ['Shell', 'Bash'],
@@ -134,9 +143,25 @@ const KIMI_TOOL_NAMES = new Map([
   ['FetchURL', 'WebFetch'],
 ]);
 
+// opencode's built-in tools use lowercase names and camelCase arg fields
+// (filePath, not file_path). The bridge plugin passes them through verbatim;
+// normalizeInput remaps both to the internal Claude vocabulary. Unmapped tools
+// (list, todowrite, …) fall through to dispatch's allow() default.
+const OPENCODE_TOOL_NAMES = new Map([
+  ['bash', 'Bash'],
+  ['read', 'Read'],
+  ['write', 'Write'],
+  ['edit', 'Edit'],
+  ['patch', 'Edit'],
+  ['grep', 'Grep'],
+  ['glob', 'Glob'],
+  ['webfetch', 'WebFetch'],
+]);
+
 function detectHarness(input) {
   const env = process.env.CLAUDE_PERMS_HARNESS;
   if (env === 'kimi' || env === 'kimicode') return HARNESS.kimi;
+  if (env === 'opencode') return HARNESS.opencode;
   if (env === 'claude' || env === 'claude-code') return HARNESS.claude;
   if (input && typeof input === 'object') {
     if ('transcript_path' in input) return HARNESS.claude;
@@ -146,16 +171,44 @@ function detectHarness(input) {
 }
 
 function normalizeInput(input, harness) {
-  if (harness !== HARNESS.kimi) return input;
-  const mapped = KIMI_TOOL_NAMES.get(input?.tool_name);
-  if (!mapped) return input; // unknown kimi tool -> dispatch's allow() default
-  return { ...input, tool_name: mapped };
+  if (harness === HARNESS.kimi) {
+    const mapped = KIMI_TOOL_NAMES.get(input?.tool_name);
+    if (!mapped) return input; // unknown kimi tool -> dispatch's allow() default
+    return { ...input, tool_name: mapped };
+  }
+  if (harness === HARNESS.opencode) {
+    const tool_name = OPENCODE_TOOL_NAMES.get(input?.tool_name) ?? input?.tool_name;
+    const tool_input = { ...(input?.tool_input ?? {}) };
+    if ('filePath' in tool_input && !('file_path' in tool_input)) {
+      tool_input.file_path = tool_input.filePath;
+    }
+    return { ...input, tool_name, tool_input };
+  }
+  return input;
 }
 
 function render(result, harness) {
   const out = result.hookSpecificOutput ?? {};
   const dec = out.permissionDecision;
   const reason = out.permissionDecisionReason ?? '';
+
+  if (harness === HARNESS.opencode) {
+    // opencode: bridge plugin parses stdout JSON. Always full JSON so an `allow`
+    // still carries updatedInput (rtk rewrite). Collapse `ask` -> `deny`:
+    // opencode's tool.execute.before can only proceed (return) or block (throw),
+    // with no interactive prompt.
+    let emitted = result;
+    if (dec === 'ask') {
+      emitted = {
+        hookSpecificOutput: {
+          ...out,
+          permissionDecision: 'deny',
+          permissionDecisionReason: `[approval required] ${reason} — opencode cannot prompt interactively; blocking. Ask the user, then retry.`,
+        },
+      };
+    }
+    return { stdout: JSON.stringify(emitted) + '\n', stderr: '', exitCode: 0 };
+  }
 
   if (harness !== HARNESS.kimi) {
     // Claude Code: decision lives entirely in stdout JSON; always exit 0.
@@ -198,6 +251,142 @@ function dispatch(input) {
     return checkGlobOrGrep(tool_name, tool_input, cwd);
   }
   return allow(`Tool ${tool_name} is not subject to permission checks.`);
+}
+
+// === Chained-hook pipeline ============================================
+//
+// claude-perms is the single PreToolUse hook the harness sees. Other PreToolUse
+// hooks — command rewriters (e.g. rtk, which rewrites `git status` -> `rtk git
+// status`) and gate hooks (e.g. a commit-message enforcer) — are registered as
+// ordered `chainedHooks` entries in ~/.claudeperms/config.json and run BEFORE
+// our own permission check. This keeps the harness looking at one hook whose
+// verdict is deterministic, and — critically — lets our own check run LAST, on
+// the command as rewritten by the chain, so an rtk-wrapped command is what we
+// evaluate and what the harness auto-approves via updatedInput.
+//
+// Contract for a chained hook (mirrors the harness's own PreToolUse contract):
+//   exit 2 + stderr          -> gate deny; stderr is the reason
+//   exit 0 + stdout JSON      -> may carry hookSpecificOutput.updatedInput.command
+//                               (a rewrite) and/or .permissionDecision (a verdict)
+//   exit 0, no JSON           -> allow, no rewrite
+//   any other failure/timeout -> allow, no rewrite (a broken or slow hook must
+//                               never block and never mutate the command)
+
+const CHAINED_HOOK_TIMEOUT_MS =
+  Number(process.env.CLAUDE_PERMS_CHAINED_HOOK_TIMEOUT_MS) || 4000;
+
+const VERDICT_RANK = { allow: 1, ask: 2, deny: 3 };
+
+// Read the ordered chained-hook list from ~/.claudeperms/config.json. Each entry
+// is { matcher, command }; order is significant (rewriters must precede any gate
+// that should see the rewrite). Missing/malformed -> [] (inert).
+function loadChainedHooks() {
+  const path = join(homedir(), '.claudeperms', 'config.json');
+  if (!existsSync(path)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    const hooks = parsed?.chainedHooks;
+    if (!Array.isArray(hooks)) return [];
+    return hooks.filter((h) => h && typeof h.command === 'string' && h.command.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+// Run one chained hook, feeding it the (possibly already-rewritten) tool-call
+// JSON on stdin. Returns { verdict, reason, updatedCommand }. Fails OPEN: any
+// outcome other than a clean exit-2 (deny) or a parseable rewrite/verdict
+// degrades to allow with no rewrite.
+function runChainedHook(command, payload) {
+  let out;
+  try {
+    out = execFileSync('/bin/sh', ['-c', command], {
+      input: payload,
+      encoding: 'utf8',
+      timeout: CHAINED_HOOK_TIMEOUT_MS,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (err) {
+    if (err && err.status === 2) {
+      const reason = (err.stderr || '').toString().trim();
+      return {
+        verdict: 'deny',
+        reason: reason || 'Blocked by a chained PreToolUse hook.',
+        updatedCommand: null,
+      };
+    }
+    return { verdict: 'allow', reason: null, updatedCommand: null };
+  }
+  if (!out || !out.trim()) return { verdict: 'allow', reason: null, updatedCommand: null };
+  let parsed;
+  try {
+    parsed = JSON.parse(out);
+  } catch {
+    return { verdict: 'allow', reason: null, updatedCommand: null };
+  }
+  const hookOut = parsed?.hookSpecificOutput ?? {};
+  const rewritten = hookOut.updatedInput?.command;
+  const updatedCommand =
+    typeof rewritten === 'string' && rewritten.length > 0 ? rewritten : null;
+  const dec = hookOut.permissionDecision;
+  const verdict = dec === 'deny' || dec === 'ask' || dec === 'allow' ? dec : 'allow';
+  return { verdict, reason: hookOut.permissionDecisionReason ?? null, updatedCommand };
+}
+
+// Run the configured chained hooks in order against the incoming tool call.
+// Threads any command rewrite forward (so a later hook — and our own check — see
+// the accumulated rewrite) and tracks the strongest gate verdict. A gate deny
+// short-circuits the chain. Returns the (possibly rewritten) tool call plus the
+// winning gate verdict.
+function runChainedPipeline(input) {
+  const working = structuredClone(input);
+  let best = { verdict: 'allow', reason: null };
+  for (const entry of loadChainedHooks()) {
+    const matcher = entry.matcher;
+    if (matcher && matcher !== '*' && matcher !== working.tool_name) continue;
+    const r = runChainedHook(entry.command, JSON.stringify(working));
+    if (r.updatedCommand) {
+      working.tool_input = { ...(working.tool_input ?? {}), command: r.updatedCommand };
+    }
+    if (VERDICT_RANK[r.verdict] > VERDICT_RANK[best.verdict]) {
+      best = { verdict: r.verdict, reason: r.reason };
+    }
+    if (best.verdict === 'deny') break;
+  }
+  return { working, gateVerdict: best.verdict, gateReason: best.reason };
+}
+
+// Merge our own decision with the strongest chained gate verdict: deny > ask >
+// allow, carrying the winning verdict's reason. (Gate deny is handled earlier in
+// main(), so here the gate is at most `ask`.)
+function mergeVerdicts(own, gateVerdict, gateReason) {
+  const ownVerdict = own?.hookSpecificOutput?.permissionDecision ?? 'allow';
+  if (VERDICT_RANK[gateVerdict] > VERDICT_RANK[ownVerdict]) {
+    return decision(
+      gateVerdict,
+      gateReason ?? own?.hookSpecificOutput?.permissionDecisionReason ?? ''
+    );
+  }
+  return own;
+}
+
+// Carry the chain's command rewrite (e.g. rtk's) into the emitted decision so
+// the harness applies it. Only for an `allow` we're emitting on a command the
+// chain actually rewrote. kimi is block-only and never consumes a rewrite, so
+// it's skipped. Emitting the rewrite alongside the same `allow` means the
+// rewritten command is auto-approved rather than re-prompted.
+function maybeAttachUpdatedInput(result, original, working, harness) {
+  if (harness !== HARNESS.claude && harness !== HARNESS.opencode) return result;
+  if (result?.hookSpecificOutput?.permissionDecision !== 'allow') return result;
+  const before = original?.tool_input?.command;
+  const after = working?.tool_input?.command;
+  if (!after || after === before) return result;
+  return {
+    hookSpecificOutput: {
+      ...result.hookSpecificOutput,
+      updatedInput: { ...working.tool_input },
+    },
+  };
 }
 
 // === Research mode ====================================================
@@ -365,6 +554,17 @@ function checkBashCommand(command, cwd, opts = {}) {
   // 2. Truncation redirects — deny only if target file exists
   const truncResult = checkTruncationRedirects(command, cwd);
   if (truncResult) return truncResult;
+
+  // 2b. Protected write targets — hard-deny overwrite/replace of an existing
+  // file on the deny-write-if-exists list (e.g. `cp .env.CI .env`).
+  const protectedTarget = commandTargetsDenyWriteIfExists(command, cwd);
+  if (protectedTarget) {
+    return deny(
+      `Refusing to overwrite existing protected file: ${protectedTarget}. ` +
+        `It is listed in deny-write-if-exists. To do this deliberately, run the ` +
+        `command yourself with the \`!\` shell prefix.`
+    );
+  }
 
   // 3. Sensitive file references (read/write split based on inferred intent)
   const sensitiveHit = commandTouchesSensitive(command, cwd);
@@ -572,6 +772,16 @@ function commandTouchesSensitive(command, cwd) {
   return null;
 }
 
+// Return the first inferred write target that is an existing protected file
+// (deny-write-if-exists), or null. Uses the same conservative write-target
+// extraction as the sensitive-file check.
+function commandTargetsDenyWriteIfExists(command, cwd) {
+  for (const target of extractWriteTargets(command, cwd)) {
+    if (isDenyWriteIfExists(target)) return target;
+  }
+  return null;
+}
+
 // Find file-arg tokens referenced in a Bash command, resolved against cwd.
 // Strips quotes; ignores flag tokens (starting with -); skips the leading command word.
 function extractFileArgs(command, cwd) {
@@ -708,68 +918,6 @@ function stripRtkWrapper(s) {
   let rest = s.slice(4).trim();
   if (rest.startsWith('proxy ')) rest = rest.slice(6).trim();
   return rest;
-}
-
-// rtk-rewrite carve-out: when enabled, this hook subsumes the separate
-// `rtk hook claude` PreToolUse hook. That hook rewrites bash commands to their
-// rtk-proxied form via `updatedInput` but emits no permissionDecision, so a
-// prior `allow` from this hook is computed against the ORIGINAL command and
-// does not survive the rewrite — Claude Code re-checks its allowlist against the
-// rewritten command and prompts. By computing the same rewrite HERE and emitting
-// it alongside our `allow` in one hookSpecificOutput, the approval and the
-// rewrite come from the same decision, so the rewritten command is auto-approved.
-// The rewrite itself is delegated to `rtk hook claude` (authoritative — it knows
-// which commands to wrap and which to skip, e.g. `cd`), never reimplemented.
-function loadRtkRewriteEnabled() {
-  const path = join(homedir(), '.claudeperms', 'config.json');
-  if (!existsSync(path)) return false;
-  try {
-    const parsed = JSON.parse(readFileSync(path, 'utf8'));
-    return parsed.rtkRewrite?.enabled === true;
-  } catch {
-    return false;
-  }
-}
-
-// Ask rtk what it would rewrite this command to. Returns the rewritten command
-// string, or null on any failure (rtk missing, timeout, no rewrite, bad output)
-// so the caller degrades to emitting the decision without a rewrite.
-function computeRtkRewrite(input) {
-  const rtkBin = process.env.CLAUDE_PERMS_RTK_BIN || 'rtk';
-  try {
-    const out = execFileSync(rtkBin, ['hook', 'claude'], {
-      input: JSON.stringify(input),
-      encoding: 'utf8',
-      timeout: 4000,
-      stdio: ['pipe', 'pipe', 'ignore'],
-    });
-    if (!out || !out.trim()) return null;
-    const cmd = JSON.parse(out)?.hookSpecificOutput?.updatedInput?.command;
-    return typeof cmd === 'string' && cmd.length > 0 ? cmd : null;
-  } catch {
-    return null;
-  }
-}
-
-// Attach rtk's command rewrite to an already-decided result. Only fires for a
-// claude-harness Bash command we're allowing, when the feature is enabled and the
-// command is not already rtk-wrapped. Preserves the existing decision verbatim and
-// adds updatedInput carrying the rewritten command (other tool_input fields kept).
-function maybeAttachRtkRewrite(result, input, harness) {
-  if (harness !== HARNESS.claude) return result;
-  if (input?.tool_name !== 'Bash') return result;
-  if (result?.hookSpecificOutput?.permissionDecision !== 'allow') return result;
-  if (!loadRtkRewriteEnabled()) return result;
-  const command = input?.tool_input?.command ?? '';
-  if (!command || command.startsWith('rtk ')) return result;
-  const rewritten = computeRtkRewrite(input);
-  if (!rewritten || rewritten === command) return result;
-  return {
-    hookSpecificOutput: {
-      ...result.hookSpecificOutput,
-      updatedInput: { ...input.tool_input, command: rewritten },
-    },
-  };
 }
 
 // `gh api` defaults to GET but can mutate via:
@@ -958,6 +1106,15 @@ function checkFileToolAccess(toolName, toolInput, cwd) {
   // Reads use the read list; writes/edits use the write list.
   const kind = toolName === 'Read' ? 'read' : 'write';
 
+  // Hard-deny overwrite/replace of an existing protected file (e.g. live .env).
+  if (absPath && kind === 'write' && isDenyWriteIfExists(absPath)) {
+    return deny(
+      `Refusing to overwrite existing protected file: ${absPath}. ` +
+        `It is listed in deny-write-if-exists. To do this deliberately, run the ` +
+        `write yourself with the \`!\` shell prefix.`
+    );
+  }
+
   if (absPath && isSensitiveFile(absPath, kind)) {
     return ask(
       `Access to sensitive file (${kind}) detected: ${absPath}. Approve only if intentional.`
@@ -1053,10 +1210,17 @@ function isPathPermitted(absPath, cwd) {
 // negation (!-prefixed) pattern matches. Negation wins regardless of order,
 // so `!~/.claude/plans/` can carve a hole out of a broader `.claude/` rule.
 function isSensitiveFile(absFilePath, kind) {
-  if (!absFilePath) return false;
   const name = kind === 'write' ? 'ask-before-write' : 'ask-before-read';
+  return pathMatchesList(absFilePath, name);
+}
+
+// True iff absFilePath matches at least one positive pattern in the named list
+// and no negation (!-prefixed) pattern. Same negation-wins semantics as
+// isSensitiveFile; shared by the sensitive-file and deny-write-if-exists lists.
+function pathMatchesList(absFilePath, listName) {
+  if (!absFilePath) return false;
   let matched = false;
-  for (const pattern of loadList(name)) {
+  for (const pattern of loadList(listName)) {
     if (pattern.startsWith('!')) {
       if (matchesSensitivePattern(absFilePath, pattern.slice(1))) return false;
     } else if (matchesSensitivePattern(absFilePath, pattern)) {
@@ -1064,6 +1228,13 @@ function isSensitiveFile(absFilePath, kind) {
     }
   }
   return matched;
+}
+
+// True iff absPath is an EXISTING file matched by the deny-write-if-exists list.
+// Used to hard-deny overwrite/replace of protected files (e.g. a live .env).
+function isDenyWriteIfExists(absPath) {
+  if (!absPath || !existsSync(absPath)) return false;
+  return pathMatchesList(absPath, 'deny-write-if-exists');
 }
 
 // Match a file path against a single pattern.

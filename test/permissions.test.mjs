@@ -403,6 +403,64 @@ describe('File tools', () => {
   });
 });
 
+describe('deny-write-if-exists', () => {
+  test('Write over existing .env denies', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dwie-'));
+    const target = join(dir, '.env');
+    writeFileSync(target, 'SECRET=1\n');
+    try {
+      const r = await runHook({
+        input: { tool_name: 'Write', tool_input: { file_path: target, content: 'x' }, cwd: dir },
+      });
+      assert.equal(r.decision, 'deny');
+      assert.match(r.reason, /overwrite existing protected file/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('Write to absent .env falls through to ask (creation allowed)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dwie-'));
+    try {
+      const r = await runHook({
+        input: { tool_name: 'Write', tool_input: { file_path: join(dir, '.env'), content: 'x' }, cwd: dir },
+      });
+      assert.notEqual(r.decision, 'deny');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('Write over existing .env.CI is not denied (dotted variant negated)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dwie-'));
+    const target = join(dir, '.env.CI');
+    writeFileSync(target, 'CI=1\n');
+    try {
+      const r = await runHook({
+        input: { tool_name: 'Write', tool_input: { file_path: target, content: 'x' }, cwd: dir },
+      });
+      assert.notEqual(r.decision, 'deny');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('Bash `cp .env.CI .env` over existing .env denies', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dwie-'));
+    writeFileSync(join(dir, '.env'), 'SECRET=1\n');
+    writeFileSync(join(dir, '.env.CI'), 'CI=1\n');
+    try {
+      const r = await runHook({
+        input: { tool_name: 'Bash', tool_input: { command: 'cp .env.CI .env' }, cwd: dir },
+      });
+      assert.equal(r.decision, 'deny');
+      assert.match(r.reason, /overwrite existing protected file/i);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('Glob / Grep', () => {
   test('Grep with a sensitive basename in pattern asks', async () => {
     const r = await runHook({
@@ -896,12 +954,13 @@ describe('Kimi harness adapter', () => {
   });
 });
 
-describe('rtk-rewrite carve-out', () => {
-  // Stub rtk: reads the hook JSON, echoes rtk's updatedInput shape wrapping the
-  // command with `rtk `. Lets us assert attach behaviour without the real binary.
-  function makeRtkStub() {
-    const dir = mkdtempSync(join(tmpdir(), 'rtk-stub-'));
-    const bin = join(dir, 'rtk');
+describe('chained PreToolUse hooks', () => {
+  // Stub a command rewriter (like rtk): reads the hook JSON on stdin and echoes
+  // an updatedInput.command computed from `rewriteJs` (a JS expression over the
+  // original `cmd`). Registered as a chainedHooks entry via its path.
+  function makeRewriteStub(rewriteJs) {
+    const dir = mkdtempSync(join(tmpdir(), 'chain-stub-'));
+    const bin = join(dir, 'stub');
     writeFileSync(
       bin,
       `#!/usr/bin/env node
@@ -910,7 +969,7 @@ process.stdin.on('data', (c) => (s += c));
 process.stdin.on('end', () => {
   const cmd = JSON.parse(s).tool_input.command;
   process.stdout.write(JSON.stringify({
-    hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput: { command: 'rtk ' + cmd } },
+    hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput: { command: (${rewriteJs}) } },
   }));
 });
 `
@@ -919,45 +978,83 @@ process.stdin.on('end', () => {
     return bin;
   }
 
-  const enabled = { 'config.json': '{"rtkRewrite":{"enabled":true}}' };
+  // config.json seeding trash (enabled, for the deletion-deny path) plus an
+  // ordered chainedHooks list.
+  const chainCfg = (hooks) =>
+    JSON.stringify({ trash: { enabled: true, location: '.trash/' }, chainedHooks: hooks });
 
-  test('allowed Bash command gets rtk-wrapped updatedInput', async () => {
+  test('a chained gate deny (exit 2 + stderr) blocks and surfaces the reason', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'ls -la' }, cwd: '/tmp' },
+      files: {
+        'config.json': chainCfg([{ matcher: 'Bash', command: 'printf "no direct commits\\n" >&2; exit 2' }]),
+      },
+    });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /no direct commits/);
+  });
+
+  test('a chained rewriter carries its rewrite as updatedInput on allow', async () => {
     const r = await runHook({
       input: { tool_name: 'Bash', tool_input: { command: 'gh pr view 130' }, cwd: '/tmp' },
-      files: enabled,
-      env: { CLAUDE_PERMS_RTK_BIN: makeRtkStub() },
+      files: { 'config.json': chainCfg([{ matcher: 'Bash', command: makeRewriteStub("'rtk ' + cmd") }]) },
     });
     assert.equal(r.decision, 'allow');
     assert.equal(r.raw.hookSpecificOutput.updatedInput.command, 'rtk gh pr view 130');
   });
 
-  test('already rtk-wrapped command is not double-wrapped', async () => {
+  test('the own check runs LAST, on the rewritten command (allow -> deny)', async () => {
+    // Own check allows `gh pr view 130`; the rewriter turns it into a deletion,
+    // which the own check denies — proving the own check saw the rewrite.
     const r = await runHook({
-      input: { tool_name: 'Bash', tool_input: { command: 'rtk gh pr view 130' }, cwd: '/tmp' },
-      files: enabled,
-      env: { CLAUDE_PERMS_RTK_BIN: makeRtkStub() },
+      input: { tool_name: 'Bash', tool_input: { command: 'gh pr view 130' }, cwd: '/tmp' },
+      files: {
+        'config.json': chainCfg([{ matcher: 'Bash', command: makeRewriteStub("'rm -rf /etc/passwd'") }]),
+      },
+    });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /Deletion is not allowed/);
+  });
+
+  test('a chained hook that errors (non-2 exit) fails open to allow, no rewrite', async () => {
+    const r = await runHook({
+      input: { tool_name: 'Bash', tool_input: { command: 'gh pr view 130' }, cwd: '/tmp' },
+      files: { 'config.json': chainCfg([{ matcher: 'Bash', command: 'echo boom; exit 1' }]) },
     });
     assert.equal(r.decision, 'allow');
     assert.equal(r.raw.hookSpecificOutput.updatedInput, undefined);
   });
 
-  test('disabled config attaches no rewrite', async () => {
+  test('a chained gate composes with research mode (deny)', async () => {
     const r = await runHook({
-      input: { tool_name: 'Bash', tool_input: { command: 'gh pr view 130' }, cwd: '/tmp' },
-      files: { 'config.json': '{"rtkRewrite":{"enabled":false}}' },
-      env: { CLAUDE_PERMS_RTK_BIN: makeRtkStub() },
+      input: { tool_name: 'WebFetch', tool_input: { url: 'https://example.com' }, cwd: '/tmp' },
+      files: { 'config.json': chainCfg([{ matcher: '', command: 'printf "blocked\\n" >&2; exit 2' }]) },
+      env: { CLAUDE_PERMS_MODE: 'research' },
+    });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /blocked/);
+  });
+});
+
+describe('opencode adapter', () => {
+  const oc = { CLAUDE_PERMS_HARNESS: 'opencode' };
+
+  test('lowercase tool name maps and a safe command allows', async () => {
+    const r = await runHook({
+      input: { tool_name: 'bash', tool_input: { command: 'ls -la' }, cwd: '/tmp' },
+      env: oc,
     });
     assert.equal(r.decision, 'allow');
-    assert.equal(r.raw.hookSpecificOutput.updatedInput, undefined);
   });
 
-  test('missing rtk binary degrades to plain allow', async () => {
+  test('ask collapses to deny (name mapping + no interactive prompt)', async () => {
+    // `rm ... inside trash` yields `ask` under Claude; opencode has no prompt,
+    // so it must surface as deny. Reaching the rm check also proves bash->Bash.
     const r = await runHook({
-      input: { tool_name: 'Bash', tool_input: { command: 'gh pr view 130' }, cwd: '/tmp' },
-      files: enabled,
-      env: { CLAUDE_PERMS_RTK_BIN: '/nonexistent/rtk' },
+      input: { tool_name: 'bash', tool_input: { command: 'rm /tmp/.trash/old' }, cwd: '/tmp' },
+      env: oc,
     });
-    assert.equal(r.decision, 'allow');
-    assert.equal(r.raw.hookSpecificOutput.updatedInput, undefined);
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /approval required/i);
   });
 });
