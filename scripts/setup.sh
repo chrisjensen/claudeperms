@@ -30,10 +30,11 @@ done
 # Rename claudeperms-package.json → package.json on first install only.
 [ -e "$DEST/package.json" ] || cp defaults/claudeperms-package.json "$DEST/package.json"
 
-# Kimi Code CLI wiring: if ~/.kimi exists, register PreToolUse hooks in
-# config.toml. permissions.mjs is tagged CLAUDE_PERMS_HARNESS=kimi so it selects
-# its kimi adapter; the two suggest scripts run under both harnesses and match
-# kimi's Shell tool (Claude's Bash). TOML has no easy CLI merge, so each block is
+# Kimi Code CLI wiring: if ~/.kimi exists, register the single permissions.mjs
+# PreToolUse hook in config.toml. permissions.mjs is tagged
+# CLAUDE_PERMS_HARNESS=kimi so it selects its kimi adapter, and it digests any
+# other configured hooks itself (chainedHooks in ~/.claudeperms/config.json), so
+# only this one block is registered. TOML has no easy CLI merge, so the block is
 # appended only when absent (idempotent). Never create ~/.kimi or clobber config.
 KIMI_DIR="$HOME/.kimi"
 KIMI_CONFIG="$KIMI_DIR/config.toml"
@@ -55,15 +56,38 @@ append_kimi_hook() {
 }
 
 if [ -d "$KIMI_DIR" ]; then
-  HOOKS_DIR="$HOME/.claude/hooks"
   append_kimi_hook "claudeperms/permissions.mjs" "" \
     "CLAUDE_PERMS_HARNESS=kimi node $DEST/permissions.mjs"
-  append_kimi_hook "long-command-suggest.sh" "Shell" \
-    "CLAUDE_PERMS_HARNESS=kimi bash $HOOKS_DIR/long-command-suggest.sh"
-  append_kimi_hook "source-commit-enforce.sh" "Shell" \
-    "CLAUDE_PERMS_HARNESS=kimi bash $HOOKS_DIR/source-commit-enforce.sh"
 else
   echo "kimi: ~/.kimi not found — skipping Kimi Code CLI wiring."
+fi
+
+# opencode wiring: if ~/.config/opencode exists, deploy the bridge plugin (always
+# overwrite — it's our code) and the provider config (copy only if missing — user
+# edits win). The plugin spawns permissions.mjs with CLAUDE_PERMS_HARNESS=opencode
+# and chains the shared shell hooks. Never create the dir or clobber user config.
+OPENCODE_DIR="$HOME/.config/opencode"
+if [ -d "$OPENCODE_DIR" ]; then
+  mkdir -p "$OPENCODE_DIR/plugins"
+  cp defaults/opencode/plugins/claudeperms.mjs "$OPENCODE_DIR/plugins/claudeperms.mjs"
+  echo "opencode: installed bridge plugin -> $OPENCODE_DIR/plugins/claudeperms.mjs"
+  # Per-family model overlays (always overwrite — our code). Selected at launch
+  # via OPENCODE_CONFIG by the hopencode/kopencode/... wrappers to pin model +
+  # small_model to one synthetic family.
+  mkdir -p "$OPENCODE_DIR/families"
+  for fam in defaults/opencode/families/*.json; do
+    [ -f "$fam" ] || continue
+    cp "$fam" "$OPENCODE_DIR/families/$(basename "$fam")"
+    echo "opencode: installed family overlay -> $OPENCODE_DIR/families/$(basename "$fam")"
+  done
+  if [ -e "$OPENCODE_DIR/opencode.json" ]; then
+    echo "opencode: $OPENCODE_DIR/opencode.json exists — leaving as-is (merge provider.anthropic.options.baseURL + synthetic models manually if needed)."
+  else
+    cp defaults/opencode/opencode.json "$OPENCODE_DIR/opencode.json"
+    echo "opencode: wrote provider config -> $OPENCODE_DIR/opencode.json"
+  fi
+else
+  echo "opencode: ~/.config/opencode not found — skipping opencode wiring."
 fi
 
 # Install check-malicious's runtime dep (anti-trojan-source) into ~/.claudeperms/.
